@@ -40,7 +40,7 @@ function vtLog(msg) {
 }
 
 // VERSION for debugging cache issues - AFTER JSON polyfill!
-var VT_SCRIPT_VERSION = '3.3.0'; // Scale-to-fit: all insert paths, respects deliberate Scale
+var VT_SCRIPT_VERSION = '3.3.1'; // Scale-to-fit: reuse pasted clips (selection was lost), log every skip
 vtLog('=== SCRIPT LOADED v' + VT_SCRIPT_VERSION + ' ===');
 
 // Clip label colors (Premiere label index per asset type)
@@ -163,18 +163,36 @@ function VT_scaleClipsToFit(clips, seq) {
         return;
     }
 
-    vtLog('VT_scaleClipsToFit: Sequence size = ' + seqWidth + 'x' + seqHeight);
+    var clipCount = 0;
+    try { clipCount = clips.length; } catch (lenErr) { }
+
+    vtLog('VT_scaleClipsToFit: Sequence size = ' + seqWidth + 'x' + seqHeight + ', clips = ' + clipCount);
+    if (!clipCount) {
+        vtLog('VT_scaleClipsToFit: nothing to scale (empty clip list)');
+        return;
+    }
 
     for (var i = 0; i < clips.length; i++) {
         var clip = clips[i];
         if (!clip) continue;
 
-        try {
-            if (!clip.components) continue;
+        var clipName = '?';
+        try { clipName = clip.name; } catch (nameErr) { }
 
-            // Skip adjustment layers and MGT (Motion Graphics Templates)
-            if (clip.isAdjustmentLayer && clip.isAdjustmentLayer()) continue;
-            if (clip.isMGT && clip.isMGT()) continue;
+        try {
+            if (!clip.components) {
+                vtLog('VT_scaleClipsToFit: ' + clipName + ' has no components, skipping');
+                continue;
+            }
+
+            // MOGRTs build themselves at sequence size - nothing to fit.
+            // Adjustment layers deliberately are NOT skipped: one authored in a
+            // 1080p project covers only the middle of a 4K frame, which is
+            // precisely the case scale-to-fit exists for.
+            if (clip.isMGT && clip.isMGT()) {
+                vtLog('VT_scaleClipsToFit: ' + clipName + ' is a MOGRT, skipping');
+                continue;
+            }
 
             // Find Motion/Scale first - audio clips and anything without it
             // drop out here before we do any measuring work.
@@ -186,12 +204,15 @@ function VT_scaleClipsToFit(clips, seq) {
                     break;
                 }
             }
-            if (!scaleProperty) continue;
+            if (!scaleProperty) {
+                vtLog('VT_scaleClipsToFit: ' + clipName + ' has no Motion/Scale, skipping');
+                continue;
+            }
 
             // Keyframed Scale is the user's animation - never overwrite it.
             try {
                 if (scaleProperty.isTimeVarying && scaleProperty.isTimeVarying()) {
-                    vtLog('VT_scaleClipsToFit: ' + clip.name + ' has keyframed Scale, skipping');
+                    vtLog('VT_scaleClipsToFit: ' + clipName + ' has keyframed Scale, skipping');
                     continue;
                 }
             } catch (kfErr) { }
@@ -201,14 +222,14 @@ function VT_scaleClipsToFit(clips, seq) {
                 var currentScale = scaleProperty.getValue();
                 if (currentScale !== null && typeof currentScale !== 'undefined' &&
                     Math.abs(currentScale - 100) > 0.01) {
-                    vtLog('VT_scaleClipsToFit: ' + clip.name + ' Scale=' + currentScale + '% was set deliberately, skipping');
+                    vtLog('VT_scaleClipsToFit: ' + clipName + ' Scale=' + currentScale + '% was set deliberately, skipping');
                     continue;
                 }
             } catch (cvErr) { }
 
             var dims = VT_getClipFrameSize(clip);
             if (!dims) {
-                vtLog('VT_scaleClipsToFit: ' + clip.name + ' source size unknown, skipping (no guess)');
+                vtLog('VT_scaleClipsToFit: ' + clipName + ' source size unknown, skipping (no guess)');
                 continue;
             }
 
@@ -217,7 +238,7 @@ function VT_scaleClipsToFit(clips, seq) {
             if (Math.abs(targetScale - 100) < 0.01) continue; // already fits
 
             scaleProperty.setValue(targetScale, true);
-            vtLog('VT_scaleClipsToFit: ' + clip.name + ' (' + dims.width + 'x' + dims.height + ') -> scale ' + Math.round(targetScale) + '%');
+            vtLog('VT_scaleClipsToFit: ' + clipName + ' (' + dims.width + 'x' + dims.height + ') -> scale ' + Math.round(targetScale) + '%');
         } catch (clipErr) {
             vtLog('VT_scaleClipsToFit: Error scaling clip: ' + clipErr);
         }
@@ -827,8 +848,9 @@ function VT_pasteAndFinalize() {
         // Re-enable pasted clips
         vtLog('DRAG-3: re-enable');
         var pastedClipsCount = 0;
+        var pastedClips = [];
         try {
-            var pastedClips = targetSeq.getSelection();
+            pastedClips = targetSeq.getSelection();
             for (var ps = 0; ps < pastedClips.length; ps++) {
                 pastedClips[ps].disabled = false;
                 if (state.assetType && LABEL_COLORS[state.assetType]) {
@@ -838,9 +860,11 @@ function VT_pasteAndFinalize() {
             }
         } catch (ee) { vtLog('DRAG-3: re-enable warn: ' + ee); }
 
-        // Scale to fit
+        // Scale to fit - reuse the clips collected above. Writing .disabled /
+        // .label can drop the timeline selection, so asking getSelection()
+        // again here handed back an empty array and scaling silently no-opped.
         vtLog('DRAG-3: scale');
-        try { VT_scaleClipsToFit(targetSeq.getSelection(), targetSeq); } catch (se) { vtLog('DRAG-3: scale warn: ' + se); }
+        try { VT_scaleClipsToFit(pastedClips, targetSeq); } catch (se) { vtLog('DRAG-3: scale warn: ' + se); }
 
         // Cleanup imported sequence
         vtLog('DRAG-3: cleanup');
@@ -1040,8 +1064,9 @@ function VT_dragDropSingleCall(assetPath, placeholderInfo, assetType) {
 
         // Re-enable pasted clips
         var pastedClipsCount = 0;
+        var pastedClips = [];
         try {
-            var pastedClips = targetSeq.getSelection();
+            pastedClips = targetSeq.getSelection();
             for (var ps = 0; ps < pastedClips.length; ps++) {
                 pastedClips[ps].disabled = false;
                 if (assetType && LABEL_COLORS[assetType]) {
@@ -1051,8 +1076,10 @@ function VT_dragDropSingleCall(assetPath, placeholderInfo, assetType) {
             }
         } catch (ee) { vtLog('DRAG-SINGLE: re-enable warn: ' + ee); }
 
-        // Scale to fit
-        try { VT_scaleClipsToFit(targetSeq.getSelection(), targetSeq); } catch (se) { }
+        // Scale to fit - reuse the clips collected above. Writing .disabled /
+        // .label can drop the timeline selection, so asking getSelection()
+        // again here handed back an empty array and scaling silently no-opped.
+        try { VT_scaleClipsToFit(pastedClips, targetSeq); } catch (se) { vtLog('DRAG-SINGLE: scale warn: ' + se); }
 
         // Cleanup imported sequence
         try {
