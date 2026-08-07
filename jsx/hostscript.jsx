@@ -40,7 +40,7 @@ function vtLog(msg) {
 }
 
 // VERSION for debugging cache issues - AFTER JSON polyfill!
-var VT_SCRIPT_VERSION = '3.2.1'; // DLL v11: CS+keyboard, long return, .rdata, targeting OK
+var VT_SCRIPT_VERSION = '3.3.0'; // Scale-to-fit: all insert paths, respects deliberate Scale
 vtLog('=== SCRIPT LOADED v' + VT_SCRIPT_VERSION + ' ===');
 
 // Clip label colors (Premiere label index per asset type)
@@ -79,7 +79,77 @@ function VT_getOrCreateAssetsBin() {
 }
 
 /**
- * Scale clips to fit the sequence frame size
+ * Read the source frame size of a QE track item.
+ * @return {Object|null} {width, height}, or null when it can't be determined
+ */
+function VT_readQeClipSize(qeClip) {
+    try {
+        var projItem = qeClip.getProjectItem();
+        if (!projItem || !projItem.clip) return null;
+        var w = projItem.clip.videoFrameWidth;
+        var h = projItem.clip.videoFrameHeight;
+        if (!w || !h) return null;
+        return { width: w, height: h };
+    } catch (e) {
+        return null;
+    }
+}
+
+/**
+ * Resolve a track item's source frame size via QE.
+ * Matches on start time first (unique within a sequence) and only falls back
+ * to a name match, so two clips sharing a name can't hand back each other's
+ * dimensions.
+ * @return {Object|null} {width, height}, or null when it can't be determined
+ */
+function VT_getClipFrameSize(clip) {
+    if (typeof qe === 'undefined' || !qe || !qe.project) return null;
+
+    var clipStart = NaN;
+    try { clipStart = parseInt(String(clip.start.ticks), 10); } catch (e) { }
+
+    try {
+        var qeSeq = qe.project.getActiveSequence();
+        if (!qeSeq) return null;
+
+        var nameMatch = null;
+        for (var t = 0; t < qeSeq.numVideoTracks; t++) {
+            var track = qeSeq.getVideoTrackAt(t);
+            if (!track) continue;
+            for (var c = 0; c < track.numItems; c++) {
+                var qeClip = track.getItemAt(c);
+                if (!qeClip || qeClip.type === 'Empty') continue;
+                if (qeClip.name !== clip.name) continue;
+
+                var size = VT_readQeClipSize(qeClip);
+                if (!size) continue;
+
+                if (!isNaN(clipStart)) {
+                    var qeStart = NaN;
+                    try { qeStart = parseInt(String(qeClip.start.ticks || qeClip.start), 10); } catch (e2) { }
+                    if (!isNaN(qeStart) && Math.abs(qeStart - clipStart) < 100) return size;
+                }
+                if (!nameMatch) nameMatch = size;
+            }
+        }
+        return nameMatch;
+    } catch (qeErr) {
+        vtLog('VT_getClipFrameSize: QE error: ' + qeErr);
+        return null;
+    }
+}
+
+/**
+ * Scale clips to fit the sequence frame size.
+ *
+ * Only clips whose Scale is still untouched (exactly 100%, no keyframes) are
+ * adjusted. An asset saved as a deliberately composed element - a PiP in the
+ * corner, an animated scale ramp - keeps the look it was saved with, which is
+ * the whole point of storing assets as real project fragments.
+ *
+ * When the source size can't be determined the clip is left alone rather than
+ * scaled against a guessed 1080p, which used to silently mangle 4K assets.
+ *
  * @param {Array} clips - Array of clips to scale
  * @param {Sequence} seq - Target sequence
  */
@@ -88,6 +158,10 @@ function VT_scaleClipsToFit(clips, seq) {
 
     var seqWidth = seq.frameSizeHorizontal;
     var seqHeight = seq.frameSizeVertical;
+    if (!seqWidth || !seqHeight) {
+        vtLog('VT_scaleClipsToFit: unknown sequence frame size, skipping');
+        return;
+    }
 
     vtLog('VT_scaleClipsToFit: Sequence size = ' + seqWidth + 'x' + seqHeight);
 
@@ -96,65 +170,54 @@ function VT_scaleClipsToFit(clips, seq) {
         if (!clip) continue;
 
         try {
-            // Skip audio clips
             if (!clip.components) continue;
 
             // Skip adjustment layers and MGT (Motion Graphics Templates)
             if (clip.isAdjustmentLayer && clip.isAdjustmentLayer()) continue;
             if (clip.isMGT && clip.isMGT()) continue;
 
-            // Get clip dimensions from QE
-            var clipWidth = 1920;  // default
-            var clipHeight = 1080; // default
-
-            if (typeof qe !== 'undefined' && qe && qe.project) {
-                try {
-                    var qeSeq = qe.project.getActiveSequence();
-                    if (qeSeq) {
-                        // Find matching QE clip by position
-                        for (var t = 0; t < qeSeq.numVideoTracks; t++) {
-                            var track = qeSeq.getVideoTrackAt(t);
-                            for (var c = 0; c < track.numItems; c++) {
-                                var qeClip = track.getItemAt(c);
-                                if (qeClip && qeClip.name === clip.name) {
-                                    try {
-                                        var projItem = qeClip.getProjectItem();
-                                        if (projItem && projItem.clip) {
-                                            clipWidth = projItem.clip.videoFrameWidth || 1920;
-                                            clipHeight = projItem.clip.videoFrameHeight || 1080;
-                                        }
-                                    } catch (e) { }
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                } catch (qeErr) {
-                    vtLog('VT_scaleClipsToFit: QE error: ' + qeErr);
-                }
-            }
-
-            // Calculate scale factors
-            var scaleX = seqWidth / clipWidth;
-            var scaleY = seqHeight / clipHeight;
-            // Use "cover" mode - fill frame completely (may crop)
-            var targetScale = Math.max(scaleX, scaleY) * 100;
-
-            vtLog('VT_scaleClipsToFit: ' + clip.name + ' (' + clipWidth + 'x' + clipHeight + ') -> scale ' + Math.round(targetScale) + '%');
-
-            // Find Motion effect and set Scale
+            // Find Motion/Scale first - audio clips and anything without it
+            // drop out here before we do any measuring work.
+            var scaleProperty = null;
             var effects = clip.components;
             for (var e = 0; e < effects.numItems; e++) {
                 if (effects[e].matchName === 'AE.ADBE Motion') {
-                    // Scale is usually property index 1
-                    var scaleProperty = effects[e].properties[1];
-                    if (scaleProperty) {
-                        scaleProperty.setValue(targetScale, true);
-                        vtLog('VT_scaleClipsToFit: Applied scale ' + Math.round(targetScale) + '% to ' + clip.name);
-                    }
+                    scaleProperty = effects[e].properties[1]; // Scale
                     break;
                 }
             }
+            if (!scaleProperty) continue;
+
+            // Keyframed Scale is the user's animation - never overwrite it.
+            try {
+                if (scaleProperty.isTimeVarying && scaleProperty.isTimeVarying()) {
+                    vtLog('VT_scaleClipsToFit: ' + clip.name + ' has keyframed Scale, skipping');
+                    continue;
+                }
+            } catch (kfErr) { }
+
+            // A Scale other than 100% was set on purpose - leave it.
+            try {
+                var currentScale = scaleProperty.getValue();
+                if (currentScale !== null && typeof currentScale !== 'undefined' &&
+                    Math.abs(currentScale - 100) > 0.01) {
+                    vtLog('VT_scaleClipsToFit: ' + clip.name + ' Scale=' + currentScale + '% was set deliberately, skipping');
+                    continue;
+                }
+            } catch (cvErr) { }
+
+            var dims = VT_getClipFrameSize(clip);
+            if (!dims) {
+                vtLog('VT_scaleClipsToFit: ' + clip.name + ' source size unknown, skipping (no guess)');
+                continue;
+            }
+
+            // "cover" mode - fill frame completely (may crop)
+            var targetScale = Math.max(seqWidth / dims.width, seqHeight / dims.height) * 100;
+            if (Math.abs(targetScale - 100) < 0.01) continue; // already fits
+
+            scaleProperty.setValue(targetScale, true);
+            vtLog('VT_scaleClipsToFit: ' + clip.name + ' (' + dims.width + 'x' + dims.height + ') -> scale ' + Math.round(targetScale) + '%');
         } catch (clipErr) {
             vtLog('VT_scaleClipsToFit: Error scaling clip: ' + clipErr);
         }
@@ -1773,6 +1836,9 @@ function VT_applyAssetNative(assetPath) {
             vtLog('VT_applyAssetNative: Selected ' + newClips.length + ' newly pasted clips');
         }
 
+        // Scale to fit - same treatment as the drag-drop paths
+        try { VT_scaleClipsToFit(newClips, targetSeqNow); } catch (se) { vtLog('VT_applyAssetNative: scale warn: ' + se); }
+
         // Cleanup - delete imported sequence
         // First try direct delete (works when sequence is closed)
         // If that fails, use moveBin workaround
@@ -2272,6 +2338,12 @@ function VT_insertExternalFile(filePath, placeholderInfo, optionsString) {
                 }
             }
 
+            // Scale to fit - imported media is the most likely to arrive at a
+            // resolution that doesn't match the sequence.
+            if (insertedClip) {
+                try { VT_scaleClipsToFit([insertedClip], seq); } catch (se) { vtLog('VT_insertExternalFile: scale warn: ' + se); }
+            }
+
             return JSON.stringify({ success: true, clipsCount: insertedClip ? 1 : 0 });
         }
 
@@ -2418,6 +2490,12 @@ function VT_insertExternalFile(filePath, placeholderInfo, optionsString) {
             vtLog('VT_insertExternalFile: No insertedClip, speed fallback');
             $.sleep(80);
             try { VT_applySpeedToSelectedClips(options.speed, options.reverse); } catch (e2) {}
+        }
+
+        // Scale to fit - imported media is the most likely to arrive at a
+        // resolution that doesn't match the sequence.
+        if (insertedClip) {
+            try { VT_scaleClipsToFit([insertedClip], seq); } catch (se) { vtLog('VT_insertExternalFile: scale warn: ' + se); }
         }
 
         return JSON.stringify({ success: true, clipsCount: insertedClip ? 1 : 0 });
