@@ -39,6 +39,11 @@ const scriptVersionEl = document.getElementById('scriptVersion');
 const assetTypeSelect = document.getElementById('assetType');
 const categorySidebar = document.getElementById('categorySidebar');
 
+// Must match VT_SCRIPT_VERSION at the top of jsx/hostscript.jsx. Premiere caches
+// ExtendScript aggressively, so a mismatch almost always means the host script
+// on disk was edited but the engine is still serving an old copy. Bump both.
+const EXPECTED_SCRIPT_VERSION = '3.4.0';
+
 // Asset list
 let assets = [];
 
@@ -431,6 +436,7 @@ async function warmUpExtendScript() {
                 try {
                     const vData = JSON.parse(versionCheck);
                     addLog('ExtendScript version: ' + vData.version);
+                    checkScriptVersion(vData.version);
                 } catch (e) {
                     addLog('ExtendScript loaded (version parse failed)');
                 }
@@ -1442,6 +1448,36 @@ function setupEventListenersContinued() {
 }
 
 /**
+ * Compare the running host script against the version this panel was built
+ * against, and shout if they differ.
+ *
+ * A mismatch means Premiere is serving a cached ExtendScript engine - edits to
+ * hostscript.jsx are on disk but not in effect. That failure mode is otherwise
+ * invisible and burns hours: everything "works", just not the new code.
+ * Warn loudly, never block - a stale host script is still a usable panel.
+ *
+ * @param {string} actual - version reported by VT_getVersion()
+ * @returns {boolean} true when it matches what the panel expects
+ */
+function checkScriptVersion(actual) {
+    const matches = actual === EXPECTED_SCRIPT_VERSION;
+
+    if (scriptVersionEl) {
+        scriptVersionEl.classList.toggle('mismatch', !matches);
+        scriptVersionEl.title = matches
+            ? 'ExtendScript v' + actual
+            : 'Version mismatch: host script is v' + actual + ', panel expects v' + EXPECTED_SCRIPT_VERSION;
+    }
+
+    if (!matches) {
+        addLog('VERSION MISMATCH: host script is v' + actual + ', panel expects v' +
+            EXPECTED_SCRIPT_VERSION + ' - reload ExtendScript, or restart Premiere if that does not help', 'error');
+    }
+
+    return matches;
+}
+
+/**
  * Fetch and display ExtendScript version
  */
 function fetchScriptVersion() {
@@ -1451,10 +1487,12 @@ function fetchScriptVersion() {
             if (scriptVersionEl && data.version) {
                 scriptVersionEl.textContent = 'v' + data.version;
                 addLog('ExtendScript version: ' + data.version, 'info');
+                checkScriptVersion(data.version);
             }
         } catch (e) {
             if (scriptVersionEl) {
                 scriptVersionEl.textContent = 'v?.?.?';
+                scriptVersionEl.classList.add('mismatch');
             }
             addLog('Could not get script version: ' + result, 'error');
         }
@@ -3062,7 +3100,7 @@ async function replacePlaceholderWithAsset(asset, placeholderInfo) {
                     // Remove the leftover vt_drag_* placeholder item from the Project
                     // panel - VT_insertExternalFile (audio/MOGRT) doesn't clean the bin
                     // like the .prproj path (VT_dragDropSingleCall) does.
-                    try { await evalScriptAsync('VT_cleanupPlaceholdersFromBin()'); } catch (e) {}
+                    try { await evalScriptAsync('VT_cleanupPlaceholdersFromBin()'); } catch (e) { addLog('Placeholder bin cleanup failed, vt_drag_ items left in Project panel: ' + e, 'error'); }
                 } else {
                     addLog('Error in result: ' + (parsed.error || 'unknown'));
                     setStatus('Error: ' + (parsed.error || 'Failed'));
@@ -3091,9 +3129,9 @@ async function replacePlaceholderWithAsset(asset, placeholderInfo) {
                     logData.lines.forEach(function (l) { if (l.trim()) addLog('  ' + l); });
                     addLog('--- END DEBUG LOG ---');
                 }
-            } catch (pe) {}
+            } catch (pe) { addLog('Could not parse the ExtendScript debug log: ' + debugLog, 'error'); }
             await evalScriptAsync('VT_clearDebugLog()');
-        } catch (dlErr) {}
+        } catch (dlErr) { addLog('Could not read the ExtendScript debug log: ' + dlErr, 'error'); }
         setStatus('Error: ' + error.message);
         setTimeout(() => setStatus('Ready'), 3000);
         throw error;
@@ -3362,7 +3400,7 @@ function cleanupTempFiles() {
                         if (now - stats.mtimeMs > oneHour) {
                             require('fs').unlinkSync(filePath);
                         }
-                    } catch (e) {}
+                    } catch (e) { addLog('Could not remove temp file ' + file + ': ' + e, 'error'); }
                 }
             });
         });

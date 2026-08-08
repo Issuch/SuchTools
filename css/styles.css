@@ -2135,6 +2135,18 @@ input[type=range]::-webkit-slider-thumb:hover {
     margin-left: 4px;
 }
 
+/* Host script version differs from what the panel expects - usually a cached
+   ExtendScript engine. Pulses so it reads as "act on this", not decoration. */
+.version-badge.mismatch {
+    background: var(--error);
+    animation: version-mismatch-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes version-mismatch-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.45; }
+}
+
 .debug-buttons {
     display: flex;
     gap: 4px;

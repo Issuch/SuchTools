@@ -36,11 +36,12 @@ function vtLog(msg) {
         f.open('a');
         f.write(new Date().toTimeString() + ' ' + msg + '\n');
         f.close();
-    } catch (e) {}
+    } catch (e) {} // MUST stay silent - logging here would recurse into vtLog forever
 }
 
 // VERSION for debugging cache issues - AFTER JSON polyfill!
-var VT_SCRIPT_VERSION = '3.3.1'; // Scale-to-fit: reuse pasted clips (selection was lost), log every skip
+// Keep in sync with EXPECTED_SCRIPT_VERSION in js/main.js - the panel warns on mismatch.
+var VT_SCRIPT_VERSION = '3.4.0'; // Log every failure that changes behaviour; panel-side version guard
 vtLog('=== SCRIPT LOADED v' + VT_SCRIPT_VERSION + ' ===');
 
 // Clip label colors (Premiere label index per asset type)
@@ -654,8 +655,9 @@ function VT_prepareDragDrop(assetPath, placeholderInfo, assetType) {
                 }
             }
         } catch (removeErr) {
+            vtLog('DRAG-1: placeholder remove failed: ' + removeErr);
             if (typeof qe !== 'undefined' && qe && qe.project) {
-                try { qe.project.undo(); } catch (ue) { }
+                try { qe.project.undo(); } catch (ue) { vtLog('DRAG-1: undo after failed remove also failed: ' + ue); }
             }
         }
 
@@ -776,7 +778,7 @@ function VT_copyAndSwitch() {
         try {
             for (var i = 0; i < app.project.sequences.numSequences; i++) {
                 if (app.project.sequences[i].sequenceID === state.importedSeqId) {
-                    try { app.project.sequences[i].close(); } catch (e) { }
+                    try { app.project.sequences[i].close(); } catch (e) { vtLog('DRAG-2: imported sequence close failed (orphan left open): ' + e); }
                     break;
                 }
             }
@@ -786,7 +788,9 @@ function VT_copyAndSwitch() {
         app.project.openSequence(state.targetSeqId);
 
         if (typeof qe !== 'undefined' && qe && qe.project) {
-            try { qe.project.getActiveSequence().makeCurrent(); } catch (e) { }
+            // If this fails the timeline is not refocused and cmd.edit.copy
+            // will target nothing - never let it pass unnoticed.
+            try { qe.project.getActiveSequence().makeCurrent(); } catch (e) { vtLog('DRAG-2: makeCurrent failed - timeline not refocused: ' + e); }
         }
 
         // Re-apply targeting after openSequence
@@ -872,14 +876,14 @@ function VT_pasteAndFinalize() {
             var allSeqs = app.project.sequences;
             for (var ci = 0; ci < allSeqs.numSequences; ci++) {
                 if (allSeqs[ci].sequenceID === state.importedSeqId) {
-                    try { allSeqs[ci].close(); } catch (e) { }
+                    try { allSeqs[ci].close(); } catch (e) { vtLog('DRAG-3: imported sequence close failed (orphan left open): ' + e); }
                     try { app.project.deleteSequence(allSeqs[ci]); } catch (e) {
                         try {
                             var delBin = app.project.rootItem.createBin('_vt_delete_');
                             qe.project.undo();
                             allSeqs[ci].projectItem.moveBin(delBin);
                             delBin.deleteBin();
-                        } catch (e2) { }
+                        } catch (e2) { vtLog('DRAG-3: bin-delete workaround failed, temp sequence left in project: ' + e2); }
                     }
                     break;
                 }
@@ -887,7 +891,7 @@ function VT_pasteAndFinalize() {
         } catch (ce) { vtLog('DRAG-3: cleanup warn: ' + ce); }
 
         // Cleanup placeholders from bin
-        try { VT_cleanupPlaceholdersFromBin(); } catch (e) { }
+        try { VT_cleanupPlaceholdersFromBin(); } catch (e) { vtLog('DRAG-3: placeholder bin cleanup failed, vt_drag_ items left behind: ' + e); }
 
         // Clear state
         $.global.VT_DragState = null;
@@ -959,8 +963,9 @@ function VT_dragDropSingleCall(assetPath, placeholderInfo, assetType) {
                 }
             }
         } catch (removeErr) {
+            vtLog('DRAG-SINGLE: placeholder remove failed: ' + removeErr);
             if (typeof qe !== 'undefined' && qe && qe.project) {
-                try { qe.project.undo(); } catch (ue) { }
+                try { qe.project.undo(); } catch (ue) { vtLog('DRAG-SINGLE: undo after failed remove also failed: ' + ue); }
             }
         }
 
@@ -1028,9 +1033,11 @@ function VT_dragDropSingleCall(assetPath, placeholderInfo, assetType) {
         // Switch back to target FIRST, then close imported (avoids a "dead" sequence state)
         app.project.openSequence(targetSeqId);
         if (typeof qe !== 'undefined' && qe && qe.project) {
-            try { qe.project.getActiveSequence().makeCurrent(); } catch (e) { }
+            // If this fails the timeline is not refocused and the paste below
+            // targets nothing - never let it pass unnoticed.
+            try { qe.project.getActiveSequence().makeCurrent(); } catch (e) { vtLog('DRAG-SINGLE: makeCurrent failed - timeline not refocused: ' + e); }
         }
-        try { importedSeq.close(); } catch (e) { }
+        try { importedSeq.close(); } catch (e) { vtLog('DRAG-SINGLE: imported sequence close failed (orphan left open): ' + e); }
 
         // Re-apply targeting
         var targetSeq = app.project.activeSequence;
@@ -1090,10 +1097,10 @@ function VT_dragDropSingleCall(assetPath, placeholderInfo, assetType) {
                 if (typeof qe !== 'undefined' && qe && qe.project) { qe.project.undo(); }
                 importedSeq.projectItem.moveBin(delBin);
                 delBin.deleteBin();
-            } catch (e2) { }
+            } catch (e2) { vtLog('DRAG-SINGLE: bin-delete workaround failed, temp sequence left in project: ' + e2); }
         }
 
-        try { VT_cleanupPlaceholdersFromBin(); } catch (e) { }
+        try { VT_cleanupPlaceholdersFromBin(); } catch (e) { vtLog('DRAG-SINGLE: placeholder bin cleanup failed, vt_drag_ items left behind: ' + e); }
 
         vtLog('DRAG-SINGLE: SUCCESS! (' + pastedClipsCount + ' clips)');
         VT_unpauseEvents();
@@ -1681,7 +1688,7 @@ function VT_saveAssetNative(outputPath) {
                 // Workaround: create temp bin, move item there, delete bin
                 var deleteBin = app.project.rootItem.createBin('_vt_to_delete_');
                 // Undo the bin creation from undo stack
-                if (typeof qe !== 'undefined' && qe && qe.project) { try { qe.project.undo(); } catch (e) { } }
+                if (typeof qe !== 'undefined' && qe && qe.project) { try { qe.project.undo(); } catch (e) { vtLog('VT_saveAssetNative: undo of bin creation failed, an extra undo step remains: ' + e); } }
 
                 tempItem.moveBin(deleteBin);
                 deleteBin.deleteBin();
@@ -1803,15 +1810,16 @@ function VT_applyAssetNative(assetPath) {
         // Close imported sequence and switch back to target
         try {
             importedSeq.close();
-        } catch (e) { }
+        } catch (e) { vtLog('VT_applyAssetNative: imported sequence close failed (orphan left open): ' + e); }
 
         app.project.openSequence(targetSeqId);
 
-        // Use QE for faster switch
+        // Use QE for faster switch. If this fails the timeline is not
+        // refocused and the paste below targets nothing.
         if (typeof qe !== 'undefined' && qe && qe.project) {
             try {
                 qe.project.getActiveSequence().makeCurrent();
-            } catch (e) { }
+            } catch (e) { vtLog('VT_applyAssetNative: makeCurrent failed - timeline not refocused: ' + e); }
         }
 
         // Set playhead
@@ -2511,12 +2519,12 @@ function VT_insertExternalFile(filePath, placeholderInfo, optionsString) {
                 }
             } catch (qeErr) {
                 vtLog('VT_insertExternalFile: QE speed failed: ' + qeErr);
-                try { VT_applySpeedToSelectedClips(options.speed, options.reverse); } catch (e2) {}
+                try { VT_applySpeedToSelectedClips(options.speed, options.reverse); } catch (e2) { vtLog('VT_insertExternalFile: speed fallback failed too - speed/reverse NOT applied: ' + e2); }
             }
         } else if (!isAudioFile && !insertedClip && (options.speed !== 1.0 || options.reverse)) {
             vtLog('VT_insertExternalFile: No insertedClip, speed fallback');
             $.sleep(80);
-            try { VT_applySpeedToSelectedClips(options.speed, options.reverse); } catch (e2) {}
+            try { VT_applySpeedToSelectedClips(options.speed, options.reverse); } catch (e2) { vtLog('VT_insertExternalFile: speed fallback failed - speed/reverse NOT applied: ' + e2); }
         }
 
         // Scale to fit - imported media is the most likely to arrive at a
