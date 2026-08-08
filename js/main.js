@@ -381,9 +381,14 @@ function init() {
     setupEventListenersContinued();
     initSettings(); // Initialize Settings Module
 
-    // Restore active module state (triggers toolbar setup)
+    // Restore active module state (triggers toolbar setup).
+    // Skipped for 'assets' because index.html already ships in exactly that
+    // state - the synthetic click would only re-run loadAssets(), scanning the
+    // whole assets directory a second time on every panel open. Mirrors the
+    // same guard in setupEventListenersContinued().
     setTimeout(() => {
         const activeModule = localStorage.getItem('vt_active_module') || 'assets';
+        if (activeModule === 'assets') return;
         const tab = document.querySelector(`.module-tab[data-module="${activeModule}"]`);
         if (tab) {
             tab.click();
