@@ -5,21 +5,67 @@
 
 import { addLog } from './log.js';
 import { AudioPreview, generateWaveform, setupStaticWaveform } from './audioPreview.js';
+import { VideoPreview } from './videoPreview.js';
 
 // Node.js modules (available in CEP)
 const fs = window.require('fs');
 const path = window.require('path');
 const os = window.require('os');
-const { exec } = window.require('child_process');
+const { execFileSync } = window.require('child_process');
 
 // Get extension directory for proper require paths (decode URL encoding)
 const extensionDir = decodeURIComponent(path.dirname(window.location.pathname.replace(/^\//, '')));
+const WM_CMD_EXE = path.join(extensionDir, 'support_files', 'VT_WMCommand.exe');
+
+// Move OS keyboard focus from the CEP panel (Chromium child owned by the
+// CEPHtmlEngine process) to the Premiere main window. The host DLL's
+// copy/paste commands use SendInput (synthetic Ctrl+C/V) which go to the
+// OS-focused window - when the panel has focus after a click/double-click
+// the keystrokes never reach Premiere. Same approach as AtomX's
+// pprsequencer.exe: find window of class "Premiere Pro", SetForegroundWindow,
+// SetFocus (via AttachThreadInput, plain SetFocus fails cross-thread).
+function runFocusFix() {
+    try {
+        const out = execFileSync(WM_CMD_EXE, ['focusfix'], { encoding: 'utf8', timeout: 5000, windowsHide: true });
+        const lastLine = String(out || '').trim().split('\n').pop();
+        addLog('focusfix: ' + lastLine);
+        return true;
+    } catch (ex) {
+        const outMsg = ex && ex.stdout ? String(ex.stdout).trim().split('\n').pop() : (ex && ex.message ? ex.message : String(ex));
+        if (ex && ex.status === 7) {
+            addLog('focusfix: ' + outMsg + ' (will rely on current focus / nest fallback)');
+            return false;
+        }
+        addLog('focusfix failed: ' + outMsg, 'warning');
+        return false;
+    }
+}
+
+// Capture the current OS focus HWND if it is the Premiere timeline, so
+// focusfix can restore it later without moving focus to the main frame
+// (which does not enable copy/paste). Exit 7 = focus is not on timeline,
+// informational only.
+function rememberTimelineFocus() {
+    try {
+        const out = execFileSync(WM_CMD_EXE, ['rememberfocus'], { encoding: 'utf8', timeout: 5000, windowsHide: true });
+        const lastLine = String(out || '').trim().split('\n').pop();
+        addLog('rememberfocus: ' + lastLine);
+    } catch (ex) {
+        const outMsg = ex && ex.stdout ? String(ex.stdout).trim().split('\n').pop() : (ex && ex.message ? ex.message : String(ex));
+        if (ex && ex.status === 7) {
+            addLog('rememberfocus: ' + outMsg);
+        } else {
+            addLog('rememberfocus failed: ' + outMsg, 'warning');
+        }
+    }
+}
 
 // CEP Interface
 const csInterface = new CSInterface();
 
 // Asset storage path
 const ASSETS_DIR = path.join(os.homedir(), 'AppData', 'Roaming', 'VibeTools', 'assets');
+const PRESETS_DIR = path.join(os.homedir(), 'AppData', 'Roaming', 'VibeTools', 'presets');
 
 // UI Elements
 const assetGrid = document.getElementById('assetGrid');
@@ -42,15 +88,37 @@ const categorySidebar = document.getElementById('categorySidebar');
 // Must match VT_SCRIPT_VERSION at the top of jsx/hostscript.jsx. Premiere caches
 // ExtendScript aggressively, so a mismatch almost always means the host script
 // on disk was edited but the engine is still serving an old copy. Bump both.
-const EXPECTED_SCRIPT_VERSION = '3.4.0';
+const EXPECTED_SCRIPT_VERSION = '3.9.12';
 
 // Asset list
 let assets = [];
 
-// Category state
-let selectedCategory = 'all';
+// Category state. v3.9.6: the panel reopens on the category that was last
+// selected, not always on All.
+const SELECTED_CATEGORY_KEY = 'vt_selected_category';
+function readSavedCategory() {
+    let saved = null;
+    try { saved = localStorage.getItem(SELECTED_CATEGORY_KEY); } catch (e) { saved = null; }
+    if (!saved) return 'all';
+    // Only accept a category that still has a tile in this version of the panel
+    return document.querySelector('.category-tile[data-category="' + saved + '"]') ? saved : 'all';
+}
+function saveSelectedCategory(category) {
+    try { localStorage.setItem(SELECTED_CATEGORY_KEY, category); } catch (e) { /* storage unavailable */ }
+}
+let selectedCategory = readSavedCategory();
 let searchFilter = ''; // Search filter text
-let recentAssets = JSON.parse(localStorage.getItem('vt_recent_assets') || '[]');
+// Stored lists can be corrupted (or storage unavailable) - never let that
+// stop the panel from loading.
+function readStoredList(key) {
+    try {
+        const v = JSON.parse(localStorage.getItem(key) || '[]');
+        return Array.isArray(v) ? v : [];
+    } catch (e) {
+        return [];
+    }
+}
+let recentAssets = readStoredList('vt_recent_assets');
 const MAX_RECENT = 10;
 
 // Context menu state
@@ -66,7 +134,8 @@ let lastSelectedAssetId = null;
 const saveDropdownMenu = document.getElementById('saveDropdownMenu');
 const saveDropdownToggle = document.getElementById('saveDropdownToggle');
 const importPicker = document.getElementById('importPicker');
-let pendingImportFile = null; // File path waiting for category selection
+let pendingImportFiles = []; // File paths waiting for category selection (batch supported)
+let _hoverVideoEl = null;    // At most ONE hover-preview video decodes at a time
 
 // Temp directory for .vtbk files
 const VTBK_TEMP_DIR = path.join(os.tmpdir(), 'VibeTools');
@@ -146,12 +215,34 @@ function getPreviewPath(assetPath) {
 function isAudioFile(filePath) {
     return /\.(mp3|wav|ogg|aac|m4a|flac|aiff)$/i.test(filePath);
 }
+/**
+ * Check if a file is a playable video format.
+ */
+function isVideoFile(filePath) {
+    if (!filePath) return false;
+    const ext = path.extname(filePath).toLowerCase();
+    return ['.mp4', '.mov', '.webm', '.avi', '.mkv', '.m4v'].includes(ext);
+}
 
 /**
  * Check if file is a MOGRT file by extension
  */
 function isMogrtFile(filePath) {
     return /\.mogrt$/i.test(filePath);
+}
+
+/**
+ * Check if file is an image by extension
+ */
+function isImageFile(filePath) {
+    return /\.(png|jpe?g|gif|tiff?|webp|bmp|psd|ai)$/i.test(filePath);
+}
+
+/**
+ * Image formats the panel browser can render as a card preview
+ */
+function isImagePreviewable(filePath) {
+    return /\.(png|jpe?g|gif|webp|bmp)$/i.test(filePath);
 }
 
 /**
@@ -172,6 +263,8 @@ function isVideoAsset(asset) {
 const previewCache = new Map();
 
 function hasPreview(asset) {
+    // No media file = no preview (defensive)
+    if (!asset.path) return false;
     // Audio files and MOGRT files don't have video preview
     if (asset.isExternal && isAudioFile(asset.path)) {
         return false;
@@ -200,7 +293,7 @@ let favoritesCache = null;
 
 function getFavoritesSet() {
     if (favoritesCache === null) {
-        favoritesCache = new Set(JSON.parse(localStorage.getItem('vt_favorites') || '[]'));
+        favoritesCache = new Set(readStoredList('vt_favorites'));
     }
     return favoritesCache;
 }
@@ -277,13 +370,41 @@ function createVtbkFile(asset) {
             _vtAssetPath: asset.path || ''
         };
 
-        // Write to temp file
-        const vtbkPath = path.join(VTBK_TEMP_DIR, 'vt_drag_' + Date.now() + '.vtbk');
-        fs.writeFileSync(vtbkPath, JSON.stringify(vtbkContent), 'utf8');
-
-        return vtbkPath;
+        // Write to a FIXED temp file path - Premiere deduplicates imports by path,
+        // so dropping the same placeholder again reuses the existing project item
+        // instead of creating a new one (AtomX-style: at most ONE placeholder item).
+        // Premiere may hold a file lock after importing the previous placeholder,
+        // so retry with delete + short wait before giving up.
+        const vtbkPath = path.join(VTBK_TEMP_DIR, 'vt_placeholder.vtbk');
+        const vtbkJson = JSON.stringify(vtbkContent);
+        let written = false;
+        for (let attempt = 0; attempt < 3 && !written; attempt++) {
+            try {
+                fs.writeFileSync(vtbkPath, vtbkJson, 'utf8');
+                written = true;
+            } catch (writeErr) {
+                if (attempt < 2) {
+                    try { fs.unlinkSync(vtbkPath); } catch (unlinkErr) { /* file may not exist or still locked */ }
+                    // Busy-wait via Atomics is not available in CEP; use a sync sleep hack
+                    const sleepUntil = Date.now() + 150;
+                    while (Date.now() < sleepUntil) { /* spin */ }
+                } else {
+                    // Last resort: unique filename so the drag can still proceed
+                    const uniquePath = path.join(VTBK_TEMP_DIR, 'vt_placeholder_' + Date.now() + '.vtbk');
+                    try {
+                        fs.writeFileSync(uniquePath, vtbkJson, 'utf8');
+                        console.warn('vtbk retry: wrote to unique path', uniquePath, 'original error:', writeErr.message);
+                        return uniquePath;
+                    } catch (finalErr) {
+                        console.error('Error creating .vtbk file (all retries failed):', finalErr.message, 'first error:', writeErr.message);
+                        return null;
+                    }
+                }
+            }
+        }
+        return written ? vtbkPath : null;
     } catch (e) {
-        console.error('Error creating .vtbk file:', e);
+        console.error('Error creating .vtbk file:', e.message || e);
         return null;
     }
 }
@@ -296,6 +417,14 @@ function initSettings() {
     const settingsDialog = document.getElementById('settingsDialog');
     const closeSettingsBtn = document.getElementById('closeSettingsBtn');
     const settingDebugPanel = document.getElementById('settingDebugPanel');
+    const settingAutoPlayAudio = document.getElementById('settingAutoPlayAudio');
+    const settingShowCardMeta = document.getElementById('settingShowCardMeta');
+    const settingShowPreviewDim = document.getElementById('settingShowPreviewDim');
+    const settingWaveformHeight = document.getElementById('settingWaveformHeight');
+    const settingSubcatFilterSize = document.getElementById('settingSubcatFilterSize');
+    const settingSidebarIconGap = document.getElementById('settingSidebarIconGap');
+    const settingPresetSoundDisabled = document.getElementById('settingPresetSoundDisabled');
+    const settingAssetSoundDisabled = document.getElementById('settingAssetSoundDisabled');
     const debugPanel = document.getElementById('debugPanel');
 
     // Functions
@@ -335,6 +464,49 @@ function initSettings() {
         settingDebugPanel.checked = showDebug;
         toggleDebugVisibility(showDebug);
     }
+    if (settingAutoPlayAudio) {
+        settingAutoPlayAudio.checked = localStorage.getItem('vt_auto_play_audio') === 'true';
+    }
+    if (settingShowCardMeta) {
+        // Default: shown (only hidden when explicitly set to 'false')
+        settingShowCardMeta.checked = localStorage.getItem('vt_show_card_meta') !== 'false';
+        applyCardMetaVisibility(settingShowCardMeta.checked);
+    }
+    if (settingShowPreviewDim) {
+        // Default: dim hidden (checked = restore original dim + title)
+        settingShowPreviewDim.checked = localStorage.getItem('vt_show_preview_dim') === 'true';
+        applyPreviewDimVisibility(settingShowPreviewDim.checked);
+    }
+    if (settingPresetSoundDisabled) {
+        settingPresetSoundDisabled.checked = localStorage.getItem('vt_preset_sound_disabled') === 'true';
+    }
+    if (settingAssetSoundDisabled) {
+        settingAssetSoundDisabled.checked = localStorage.getItem('vt_asset_sound_disabled') === 'true';
+    }
+    if (settingWaveformHeight) {
+        const savedWaveH = parseInt(localStorage.getItem('vt_waveform_height') || '40', 10);
+        const waveH = (isNaN(savedWaveH) ? 40 : Math.min(100, Math.max(0, savedWaveH)));
+        settingWaveformHeight.value = waveH;
+        applyWaveformHeight(waveH);
+        const waveHValueEl = document.getElementById('settingWaveformHeightValue');
+        if (waveHValueEl) waveHValueEl.textContent = waveH === 0 ? 'Off' : waveH + ' px';
+    }
+    if (settingSubcatFilterSize) {
+        const savedChipSize = parseInt(localStorage.getItem('vt_subcat_chip_size') || '11', 10);
+        const chipSize = (isNaN(savedChipSize) ? 11 : Math.min(20, Math.max(8, savedChipSize)));
+        settingSubcatFilterSize.value = chipSize;
+        applySubcatFilterSize(chipSize);
+        const chipSizeValueEl = document.getElementById('settingSubcatFilterSizeValue');
+        if (chipSizeValueEl) chipSizeValueEl.textContent = chipSize + ' px';
+    }
+
+    if (settingSidebarIconGap) {
+        const gap = readSidebarIconGap();
+        settingSidebarIconGap.value = gap;
+        applySidebarIconGap(gap);
+        const gapValueEl = document.getElementById('settingSidebarIconGapValue');
+        if (gapValueEl) gapValueEl.textContent = gap + ' px';
+    }
 
     // Event Listeners
     // Use document delegation for settingsBtn since it might be recreated by switchModule
@@ -360,6 +532,226 @@ function initSettings() {
             toggleDebugVisibility(this.checked);
         });
     }
+
+    if (settingAutoPlayAudio) {
+        settingAutoPlayAudio.addEventListener('change', function () {
+            localStorage.setItem('vt_auto_play_audio', this.checked);
+        });
+    }
+
+    if (settingShowCardMeta) {
+        settingShowCardMeta.addEventListener('change', function () {
+            localStorage.setItem('vt_show_card_meta', this.checked);
+            applyCardMetaVisibility(this.checked);
+        });
+    }
+
+    if (settingShowPreviewDim) {
+        settingShowPreviewDim.addEventListener('change', function () {
+            localStorage.setItem('vt_show_preview_dim', this.checked);
+            applyPreviewDimVisibility(this.checked);
+        });
+    }
+
+    if (settingPresetSoundDisabled) {
+        settingPresetSoundDisabled.addEventListener('change', function () {
+            localStorage.setItem('vt_preset_sound_disabled', this.checked);
+        });
+    }
+
+    if (settingAssetSoundDisabled) {
+        settingAssetSoundDisabled.addEventListener('change', function () {
+            localStorage.setItem('vt_asset_sound_disabled', this.checked);
+        });
+    }
+
+    if (settingWaveformHeight) {
+        settingWaveformHeight.addEventListener('input', function () {
+            const raw = parseInt(this.value, 10);
+            const px = isNaN(raw) ? 40 : raw;
+            const waveHValueEl = document.getElementById('settingWaveformHeightValue');
+            if (waveHValueEl) waveHValueEl.textContent = px === 0 ? 'Off' : px + ' px';
+            applyWaveformHeight(px);
+        });
+        settingWaveformHeight.addEventListener('change', function () {
+            localStorage.setItem('vt_waveform_height', this.value);
+        });
+    }
+
+    if (settingSubcatFilterSize) {
+        settingSubcatFilterSize.addEventListener('input', function () {
+            const raw = parseInt(this.value, 10);
+            const px = isNaN(raw) ? 11 : raw;
+            const chipSizeValueEl = document.getElementById('settingSubcatFilterSizeValue');
+            if (chipSizeValueEl) chipSizeValueEl.textContent = px + ' px';
+            applySubcatFilterSize(px);
+        });
+        settingSubcatFilterSize.addEventListener('change', function () {
+            localStorage.setItem('vt_subcat_chip_size', this.value);
+        });
+    }
+
+    if (settingSidebarIconGap) {
+        settingSidebarIconGap.addEventListener('input', function () {
+            const px = clampSidebarIconGap(parseInt(this.value, 10));
+            const gapValueEl = document.getElementById('settingSidebarIconGapValue');
+            if (gapValueEl) gapValueEl.textContent = px + ' px';
+            applySidebarIconGap(px);
+        });
+        settingSidebarIconGap.addEventListener('change', function () {
+            try { localStorage.setItem('vt_sidebar_icon_gap', clampSidebarIconGap(parseInt(this.value, 10))); } catch (e) { /* storage unavailable */ }
+        });
+    }
+}
+
+/**
+ * Empty space between the category icons in the sidebar. One value for every
+ * gap, so the icons are evenly spaced; the group separator is only a line and
+ * adds nothing of its own.
+ */
+const SIDEBAR_ICON_GAP_DEFAULT = 10;
+function clampSidebarIconGap(px) {
+    if (isNaN(px)) return SIDEBAR_ICON_GAP_DEFAULT;
+    return Math.min(30, Math.max(0, px));
+}
+function readSidebarIconGap() {
+    let raw = null;
+    try { raw = localStorage.getItem('vt_sidebar_icon_gap'); } catch (e) { raw = null; }
+    if (raw === null || raw === '') return SIDEBAR_ICON_GAP_DEFAULT;
+    return clampSidebarIconGap(parseInt(raw, 10));
+}
+function applySidebarIconGap(px) {
+    const gap = clampSidebarIconGap(px);
+    document.documentElement.style.setProperty('--sidebar-icon-gap', gap + 'px');
+    if (!categorySidebar) return;
+    // Set it on the elements as well: CEP serves the panel's stylesheet from
+    // its own cache and can hand out an older copy after a restart, and an
+    // inline style wins over whichever copy is live (v3.9.6).
+    categorySidebar.querySelectorAll('.category-tile').forEach(function (t) {
+        t.style.marginBottom = gap + 'px';
+    });
+    categorySidebar.querySelectorAll('.sidebar-divider').forEach(function (d) {
+        d.style.height = '0';
+        d.style.margin = '0';
+        d.style.background = 'none';
+    });
+}
+
+/**
+ * Whether clicking an audio/video asset should immediately start playback.
+ */
+function isAutoPlayAudioEnabled() {
+    return localStorage.getItem('vt_auto_play_audio') === 'true';
+}
+
+/**
+ * Whether preset save/apply sounds are muted.
+ */
+function isPresetSoundDisabled() {
+    return localStorage.getItem('vt_preset_sound_disabled') === 'true';
+}
+function isAssetSoundDisabled() {
+    return localStorage.getItem('vt_asset_sound_disabled') === 'true';
+}
+
+/**
+ * Show/hide the "TYPE В· Subcategory" meta line under asset previews.
+ * Toggles a class on the grid so cached cards update instantly.
+ */
+function applyCardMetaVisibility(show) {
+    if (assetGrid) {
+        assetGrid.classList.toggle('hide-card-meta', !show);
+    }
+}
+
+/**
+ * Show/hide the dark dim gradient + title overlay on cards with real
+ * previews (video files). Off by default; a selected/playing card
+ * always hides the overlay regardless of this setting.
+ */
+function applyPreviewDimVisibility(show) {
+    if (assetGrid) {
+        assetGrid.classList.toggle('show-preview-dim', show);
+    }
+}
+
+/**
+ * Adjust the height of the waveform row inside the audio preview bar.
+ */
+function applyWaveformHeight(px) {
+    const off = !px;
+    // Off state: keep a slim strip so the progress line still shows
+    const effective = off ? 14 : px;
+    ['audioPreviewBar', 'videoPreviewBar'].forEach(function (id) {
+        const bar = document.getElementById(id);
+        if (bar) {
+            bar.style.setProperty('--waveform-height', effective + 'px');
+            bar.classList.toggle('waveform-off', off);
+        }
+    });
+}
+
+/**
+ * Adjust the font size of the subcategory filter chips via a CSS variable,
+ * so it survives the filter bar's innerHTML rebuilds on every render.
+ */
+function applySubcatFilterSize(px) {
+    document.documentElement.style.setProperty('--filter-chip-size', px + 'px');
+}
+
+/**
+ * Aspect ratio helpers - the 16:9 / 9:16 choice is stored per category
+ * ("group"), e.g. video can be 9:16 while audio stays 16:9.
+ */
+function getCategoryAspect(category) {
+    return localStorage.getItem('vt_aspect_' + category) || '16:9';
+}
+
+function setCategoryAspect(category, aspect) {
+    localStorage.setItem('vt_aspect_' + category, aspect);
+}
+
+/**
+ * Apply the stored aspect of a category to the grid and sync the
+ * toolbar buttons' active state.
+ */
+function applyCategoryAspect(category) {
+    const aspect = getCategoryAspect(category);
+    document.documentElement.style.setProperty('--card-aspect', aspect === '9:16' ? '9/16' : '16/9');
+    document.querySelectorAll('.aspect-btn').forEach(b => {
+        b.classList.toggle('active', b.dataset.aspect === aspect);
+    });
+}
+
+/**
+ * Zoom helpers - the card size slider is stored per category ("group")
+ * too, so every group can keep its own layout.
+ */
+const ZOOM_SNAP_WIDTHS = {
+    1: '110px', // Small
+    2: '160px', // Medium
+    3: '100%'   // Full width (1 column)
+};
+
+function getCategoryZoom(category) {
+    // Legacy global step seeds groups that were never set individually
+    return localStorage.getItem('vt_zoom_step_' + category)
+        || localStorage.getItem('vt_zoom_step')
+        || '2';
+}
+
+function setCategoryZoom(category, step) {
+    localStorage.setItem('vt_zoom_step_' + category, step);
+}
+
+/**
+ * Apply the stored zoom of a category to the grid and sync the slider.
+ */
+function applyCategoryZoom(category) {
+    const step = getCategoryZoom(category);
+    const zoomSlider = document.getElementById('zoomSlider');
+    if (zoomSlider) zoomSlider.value = step;
+    assetGrid.style.setProperty('--card-min-width', ZOOM_SNAP_WIDTHS[step] || ZOOM_SNAP_WIDTHS[2]);
 }
 
 /**
@@ -367,14 +759,24 @@ function initSettings() {
  */
 function init() {
 
+    // Register undo-group collapse listener (event-driven, no polling)
+    registerUndoEventListener();
+
     // Ensure assets directory exists
     ensureAssetsDir();
 
     // Clean up temporary files
     cleanupTempFiles();
 
+    // Finish deletes whose files were still locked, and remove leftovers of
+    // deletes that failed in older versions (v3.9.6)
+    try { retryPendingDeletes(); sweepOrphanAssetFiles(); } catch (e) { /* non-fatal */ }
+
     // Load existing assets
     loadAssets();
+
+    // Load effect presets
+    loadPresets();
 
     // Setup event listeners
     setupEventListeners();
@@ -400,6 +802,7 @@ function init() {
 
     // Initialize Audio Preview Bar
     if (AudioPreview) AudioPreview.init();
+    if (VideoPreview) VideoPreview.init();
 
     setStatus('Ready');
 }
@@ -685,6 +1088,71 @@ function initToolbarEvents() {
         };
     }
 
+    // Presets dropdown
+    const presetsBtn = document.getElementById('presetsBtn');
+    const presetsMenu = document.getElementById('presetsMenu');
+    if (presetsBtn && presetsMenu) {
+        presetsBtn.onclick = async function (e) {
+            e.stopPropagation();
+            const isShown = presetsMenu.classList.contains('show');
+            document.querySelectorAll('.dropdown-menu.show').forEach(function (m) {
+                if (m !== presetsMenu) m.classList.remove('show');
+            });
+            presetsMenu.classList.toggle('show', !isShown);
+            if (!isShown) {
+                await refreshCurrentClipKey();
+                loadPresets();
+                syncPresetOptionChips();
+                const pi = document.getElementById('presetNameInput');
+                if (pi) setTimeout(function () { pi.focus(); }, 50);
+                // Follow the timeline selection while the menu is open, so the
+                // list always matches the clip that is selected now (v3.9.4)
+                if (!window._vtPresetPoll) {
+                    window._vtPresetPoll = setInterval(async function () {
+                        if (!presetsMenu.classList.contains('show')) {
+                            clearInterval(window._vtPresetPoll);
+                            window._vtPresetPoll = null;
+                            return;
+                        }
+                        if (isVtBusy() || window._vtInserting) return;
+                        const before = currentClipKey;
+                        await refreshCurrentClipKey();
+                        if (currentClipKey !== before) renderPresetList();
+                    }, 1200);
+                }
+            }
+        };
+
+        document.querySelectorAll('.preset-opt').forEach(function (b) {
+            b.onclick = function (e) {
+                e.stopPropagation();
+                const on = b.getAttribute('aria-pressed') !== 'true';
+                b.setAttribute('aria-pressed', on ? 'true' : 'false');
+                setPresetOption(b.dataset.opt, on);
+            };
+        });
+
+        if (!window._vtPresetsOutsideBound) {
+            window._vtPresetsOutsideBound = true;
+            document.addEventListener('click', function (e) {
+                const dd = document.getElementById('presetsDropdown');
+                const menu = document.getElementById('presetsMenu');
+                if (dd && menu && !dd.contains(e.target)) menu.classList.remove('show');
+            });
+        }
+
+        const presetSaveBtn = document.getElementById('presetSaveBtn');
+        if (presetSaveBtn) presetSaveBtn.onclick = savePresetFromSelection;
+
+
+        const presetNameInput = document.getElementById('presetNameInput');
+        if (presetNameInput) {
+            presetNameInput.onkeydown = function (e) {
+                if (e.key === 'Enter') savePresetFromSelection();
+            };
+        }
+    }
+
     // Search input
     const searchInput = document.getElementById('searchInput');
     if (searchInput) {
@@ -693,6 +1161,213 @@ function initToolbarEvents() {
             renderAssets();
         };
     }
+}
+
+// ===================== SIDEBAR ICON ORDER (v3.9.6) =====================
+// The category icons can be dragged into any order; the order is remembered
+// per panel. The right-click menu collapses the sidebar (this used to be the
+// arrow button) and resets the order.
+const SIDEBAR_ORDER_KEY = 'vt_sidebar_order';
+const SIDEBAR_DIVIDER_TOKEN = '|';
+let defaultSidebarOrder = null;
+let sidebarDragJustEnded = false;
+let toggleSidebarCollapsed = null;
+
+function sidebarOrderTokens() {
+    const out = [];
+    if (!categorySidebar) return out;
+    Array.prototype.forEach.call(categorySidebar.children, function (el) {
+        if (el.classList.contains('sidebar-divider')) out.push(SIDEBAR_DIVIDER_TOKEN);
+        else if (el.classList.contains('category-tile') && el.dataset.category) out.push(el.dataset.category);
+    });
+    return out;
+}
+
+function captureDefaultSidebarOrder() {
+    if (!defaultSidebarOrder) defaultSidebarOrder = sidebarOrderTokens();
+}
+
+function applySidebarOrderTokens(tokens) {
+    if (!categorySidebar || !tokens || !tokens.length) return;
+    const tiles = {};
+    const dividers = [];
+    const rest = [];
+    Array.prototype.forEach.call(Array.prototype.slice.call(categorySidebar.children), function (el) {
+        if (el.classList.contains('sidebar-divider')) dividers.push(el);
+        else if (el.classList.contains('category-tile') && el.dataset.category) tiles[el.dataset.category] = el;
+        else rest.push(el);
+    });
+    const frag = document.createDocumentFragment();
+    const used = {};
+    tokens.forEach(function (tok) {
+        if (tok === SIDEBAR_DIVIDER_TOKEN) {
+            if (dividers.length) frag.appendChild(dividers.shift());
+        } else if (tiles[tok] && !used[tok]) {
+            used[tok] = true;
+            frag.appendChild(tiles[tok]);
+        }
+    });
+    // Categories added in a later version, and any leftovers, keep their place at the end
+    Object.keys(tiles).forEach(function (cat) { if (!used[cat]) frag.appendChild(tiles[cat]); });
+    dividers.forEach(function (d) { frag.appendChild(d); });
+    rest.forEach(function (el) { frag.appendChild(el); });
+    categorySidebar.appendChild(frag);
+}
+
+function applySidebarOrder() {
+    let saved = null;
+    try { saved = JSON.parse(localStorage.getItem(SIDEBAR_ORDER_KEY) || 'null'); } catch (e) { saved = null; }
+    if (Array.isArray(saved) && saved.length) applySidebarOrderTokens(saved);
+}
+
+function saveSidebarOrder() {
+    try { localStorage.setItem(SIDEBAR_ORDER_KEY, JSON.stringify(sidebarOrderTokens())); } catch (e) { /* storage unavailable */ }
+}
+
+function resetSidebarOrder() {
+    try { localStorage.removeItem(SIDEBAR_ORDER_KEY); } catch (e) { /* storage unavailable */ }
+    if (defaultSidebarOrder) applySidebarOrderTokens(defaultSidebarOrder);
+    setStatus('Icon order reset');
+}
+
+/**
+ * A separator dragged above the first icon or below the last one separates
+ * nothing - it is pulled back next to the icon it was dropped on, so the
+ * sidebar never opens with an empty strip at the top (v3.9.6).
+ */
+function tidySidebarDivider() {
+    if (!categorySidebar) return;
+    const kids = Array.prototype.slice.call(categorySidebar.children);
+    const tiles = kids.filter(function (el) { return el.classList.contains('category-tile'); });
+    if (tiles.length < 2) return;
+    kids.filter(function (el) { return el.classList.contains('sidebar-divider'); })
+        .forEach(function (div) {
+            if (categorySidebar.firstElementChild === div) categorySidebar.insertBefore(div, tiles[1]);
+            else if (categorySidebar.lastElementChild === div) categorySidebar.insertBefore(div, tiles[tiles.length - 1]);
+        });
+}
+
+// The tile of the category the panel reopened on gets the highlight (v3.9.6)
+function highlightSelectedCategoryTile() {
+    if (!categorySidebar) return;
+    categorySidebar.querySelectorAll('.category-tile').forEach(function (t) {
+        t.classList.toggle('active', t.dataset.category === selectedCategory);
+    });
+}
+
+function initSidebarReorder() {
+    if (!categorySidebar) return;
+    let drag = null;
+
+    categorySidebar.addEventListener('mousedown', function (e) {
+        if (e.button !== 0) return;
+        // The group separator is draggable too, so the break between the
+        // groups can be moved wherever the icons were moved (v3.9.6)
+        const tile = e.target.closest('.category-tile, .sidebar-divider');
+        if (!tile) return;
+        drag = { tile: tile, startX: e.clientX, startY: e.clientY, moved: false };
+    });
+
+    document.addEventListener('mousemove', function (e) {
+        if (!drag) return;
+        if (!drag.moved) {
+            if (Math.abs(e.clientY - drag.startY) < 5 && Math.abs(e.clientX - drag.startX) < 5) return;
+            drag.moved = true;
+            drag.tile.classList.add('vt-dragging');
+            categorySidebar.classList.add('vt-reordering');
+        }
+        e.preventDefault();
+        const tiles = categorySidebar.querySelectorAll('.category-tile');
+        if (!tiles.length) return;
+        const first = tiles[0], last = tiles[tiles.length - 1];
+        // Above the first icon / below the last one: move to that end
+        if (e.clientY < first.getBoundingClientRect().top) {
+            if (first !== drag.tile) categorySidebar.insertBefore(drag.tile, first);
+            return;
+        }
+        if (e.clientY > last.getBoundingClientRect().bottom) {
+            if (last !== drag.tile) categorySidebar.insertBefore(drag.tile, last.nextSibling);
+            return;
+        }
+        for (let i = 0; i < tiles.length; i++) {
+            const t = tiles[i];
+            if (t === drag.tile) continue;
+            const r = t.getBoundingClientRect();
+            if (e.clientY < r.top || e.clientY > r.bottom) continue;
+            if (e.clientY < r.top + r.height / 2) categorySidebar.insertBefore(drag.tile, t);
+            else categorySidebar.insertBefore(drag.tile, t.nextSibling);
+            break;
+        }
+    });
+
+    document.addEventListener('mouseup', function () {
+        if (!drag) return;
+        const moved = drag.moved;
+        drag.tile.classList.remove('vt-dragging');
+        categorySidebar.classList.remove('vt-reordering');
+        drag = null;
+        if (!moved) return;
+        tidySidebarDivider();
+        saveSidebarOrder();
+        sidebarDragJustEnded = true;
+        // Safety net in case no click follows the mouseup
+        setTimeout(function () { sidebarDragJustEnded = false; }, 300);
+    });
+}
+
+function initSidebarContextMenu() {
+    if (!categorySidebar) return;
+    categorySidebar.addEventListener('contextmenu', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        const mainCtx = document.getElementById('contextMenu');
+        if (mainCtx) mainCtx.style.display = 'none';
+        document.querySelectorAll('.context-menu:not(#contextMenu)').forEach(function (m) { m.remove(); });
+
+        const menu = document.createElement('div');
+        menu.className = 'context-menu';
+        menu.style.left = e.clientX + 'px';
+        menu.style.top = e.clientY + 'px';
+        menu.style.display = 'block';
+        menu.style.minWidth = '170px';
+
+        const collapsed = categorySidebar.classList.contains('collapsed');
+        const itemCollapse = document.createElement('div');
+        itemCollapse.className = 'context-item';
+        itemCollapse.innerHTML = '<svg viewBox="0 0 24 24" class="ctx-icon"><polyline points="' +
+            (collapsed ? '9 18 15 12 9 6' : '15 18 9 12 15 6') + '"/></svg>' +
+            (collapsed ? 'Show names' : 'Icons only');
+        itemCollapse.onclick = function () {
+            menu.remove();
+            if (toggleSidebarCollapsed) toggleSidebarCollapsed();
+        };
+
+        const itemReset = document.createElement('div');
+        itemReset.className = 'context-item';
+        itemReset.innerHTML = '<svg viewBox="0 0 24 24" class="ctx-icon"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>Reset icon order';
+        itemReset.onclick = function () {
+            menu.remove();
+            resetSidebarOrder();
+        };
+
+        menu.appendChild(itemCollapse);
+        menu.appendChild(document.createElement('div')).className = 'context-divider';
+        menu.appendChild(itemReset);
+        document.body.appendChild(menu);
+
+        // Keep the menu on screen
+        const r = menu.getBoundingClientRect();
+        if (r.bottom > window.innerHeight) menu.style.top = Math.max(0, window.innerHeight - r.height - 4) + 'px';
+        if (r.right > window.innerWidth) menu.style.left = Math.max(0, window.innerWidth - r.width - 4) + 'px';
+
+        setTimeout(function () {
+            document.addEventListener('click', function close(ev) {
+                if (menu.contains(ev.target)) return;
+                menu.remove();
+                document.removeEventListener('click', close);
+            });
+        }, 0);
+    });
 }
 
 /**
@@ -784,9 +1459,21 @@ function setupEventListenersContinued() {
     // Fetch script version on startup
     fetchScriptVersion();
 
+    // Category sidebar: restore the user's own icon order first (v3.9.6)
+    if (categorySidebar) {
+        captureDefaultSidebarOrder();
+        applySidebarOrder();
+        tidySidebarDivider();
+        initSidebarReorder();
+        initSidebarContextMenu();
+        highlightSelectedCategoryTile();
+    }
+
     // Category sidebar click handler
     if (categorySidebar) {
         categorySidebar.addEventListener('click', function (e) {
+            // A click that ended a drag must not switch the category
+            if (sidebarDragJustEnded) { sidebarDragJustEnded = false; return; }
             const tile = e.target.closest('.category-tile');
             if (!tile) return;
 
@@ -800,9 +1487,15 @@ function setupEventListenersContinued() {
             // Update selected category and re-render
             if (selectedCategory === category) return;
             selectedCategory = category;
+            saveSelectedCategory(category);
+
+            // Apply this category's aspect ratio and zoom
+            applyCategoryAspect(category);
+            applyCategoryZoom(category);
 
             // Hide audio preview when switching
             if (AudioPreview) AudioPreview.hide();
+            if (VideoPreview) VideoPreview.hide();
 
             renderAssets();
         });
@@ -819,15 +1512,15 @@ function setupEventListenersContinued() {
         });
     }
 
-    // Sidebar toggle (collapse/expand)
-    const sidebarToggle = document.getElementById('sidebarToggle');
-    if (sidebarToggle && categorySidebar) {
+    // Sidebar collapse/expand. v3.9.6: the arrow button is gone - this now runs
+    // from the sidebar's right-click menu.
+    if (categorySidebar) {
         // Restore state from localStorage
         if (localStorage.getItem('vt_sidebar_collapsed') === 'true') {
             categorySidebar.classList.add('collapsed');
         }
 
-        sidebarToggle.addEventListener('click', function () {
+        toggleSidebarCollapsed = function () {
             if (!assetGrid) {
                 categorySidebar.classList.toggle('collapsed');
                 localStorage.setItem('vt_sidebar_collapsed', categorySidebar.classList.contains('collapsed'));
@@ -938,7 +1631,7 @@ function setupEventListenersContinued() {
                 });
                 assetGrid.style.height = '';
             }, totalDuration + 50);
-        });
+        };
     }
 
     // Module tabs switching
@@ -1053,43 +1746,8 @@ function setupEventListenersContinued() {
      * @param {string[]} ids - Array of asset IDs
      */
     async function batchDeleteAssets(ids) {
-        if (!ids || ids.length === 0) return;
-
-        const confirmed = await showDeleteDialog(`${ids.length} selected items`);
-        if (!confirmed) return;
-
-        setStatus(`Deleting ${ids.length} assets...`);
-
-        let deletedCount = 0;
-
-        for (const id of ids) {
-            const asset = assets.find(a => a.id === id);
-            if (asset) {
-                try {
-                    // Delete files
-                    const prprojPath = asset.path;
-                    const metaPath = path.join(ASSETS_DIR, asset.id + '.json');
-                    const previewPath = getPreviewPath(asset.path);
-
-                    if (fs.existsSync(prprojPath)) fs.unlinkSync(prprojPath);
-                    if (fs.existsSync(metaPath)) fs.unlinkSync(metaPath);
-                    if (fs.existsSync(previewPath)) fs.unlinkSync(previewPath);
-
-                    // Remove from memory
-                    assets = assets.filter(a => a.id !== id);
-                    deletedCount++;
-                } catch (e) {
-                    console.error('Error deleting asset ' + id, e);
-                    addLog('Error deleting asset ' + id + ': ' + e, 'error');
-                }
-            }
-        }
-
-        selectedAssetIds.clear();
-        invalidateAllCardCache();
-        renderAssets();
-        setStatus(`Deleted ${deletedCount} assets`);
-        addLog(`Batch deleted ${deletedCount} assets`);
+        // v3.9.6: no confirmation - deleted straight away
+        await deleteAssetsNow(ids);
     }
 
     // Context menu: Rename Asset
@@ -1142,7 +1800,10 @@ function setupEventListenersContinued() {
         if (newName && newName !== renameAsset.name) {
             try {
                 // Update metadata
-                const metaPath = renameAsset.path.replace('.prproj', '.json');
+                // Metadata always lives at <ASSETS_DIR>/<id>.json. Deriving it from
+                // asset.path broke renaming imported media (.jpg/.mp4/.mp3): the
+                // "metadata" path was the media file itself.
+                const metaPath = path.join(ASSETS_DIR, renameAsset.id + '.json');
                 const metadata = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
                 metadata.name = newName;
                 fs.writeFileSync(metaPath, JSON.stringify(metadata, null, 2));
@@ -1348,28 +2009,8 @@ function setupEventListenersContinued() {
     if (importPicker) {
         importPicker.addEventListener('change', function (e) {
             if (!e.target.files.length) return;
-            pendingImportFile = e.target.files[0].path;
-
-            // 1. Show dialog first
-            saveDialog.style.display = 'flex';
-
-            // 2. Initialize UI components
-            initCustomSelect();
-            populateSubcategories();
-
-            // 3. Auto-detect type and update Select UI
-            const autoType = detectTypeFromExtension(pendingImportFile);
-            // Re-query options after init
-            const targetOption = Array.from(document.querySelectorAll('.custom-option')).find(el => el.dataset.value === autoType);
-            if (targetOption) {
-                targetOption.click();
-            }
-
-            filterAssetTypes(autoType);
-            populateSubcategories(autoType);
-            // 4. Set name
-            assetNameInput.value = path.basename(pendingImportFile, path.extname(pendingImportFile));
-            assetNameInput.focus();
+            const filePaths = Array.from(e.target.files).map(f => f.path).filter(Boolean);
+            openImportDialog(filePaths);
             importPicker.value = '';
         });
     }
@@ -1394,52 +2035,28 @@ function setupEventListenersContinued() {
             assetGrid.classList.remove('drop-zone');
             if (e.dataTransfer.files.length > 0) {
                 e.preventDefault();
-                pendingImportFile = e.dataTransfer.files[0].path;
-
-                // 1. Show dialog first
-                saveDialog.style.display = 'flex';
-
-                // 2. Initialize UI components
-                initCustomSelect();
-                populateSubcategories();
-
-                // 3. Auto-detect type and update Select UI
-                const autoType = detectTypeFromExtension(pendingImportFile);
-                const targetOption = Array.from(document.querySelectorAll('.custom-option')).find(el => el.dataset.value === autoType);
-                if (targetOption) targetOption.click();
-                filterAssetTypes(autoType);
-                populateSubcategories(autoType);
-
-                // 4. Set name
-                assetNameInput.value = path.basename(pendingImportFile, path.extname(pendingImportFile));
-                assetNameInput.focus();
+                const filePaths = Array.from(e.dataTransfer.files).map(f => f.path).filter(Boolean);
+                openImportDialog(filePaths);
             }
         });
     }
 
-    // Bottom toolbar: Zoom slider (Discrete Snapping)
+    // Bottom toolbar: Zoom slider (Discrete Snapping, stored per category/group)
     const zoomSlider = document.getElementById('zoomSlider');
     if (zoomSlider && assetGrid) {
-        const snapWidths = {
-            1: '110px', // Small
-            2: '160px', // Medium
-            3: '100%'   // Full width (1 column)
-        };
-
-        // Restore saved step
-        const savedStep = localStorage.getItem('vt_zoom_step') || '2';
-        zoomSlider.value = savedStep;
-        assetGrid.style.setProperty('--card-min-width', snapWidths[savedStep]);
+        // Restore saved step for the current category
+        applyCategoryZoom(selectedCategory);
 
         zoomSlider.addEventListener('input', function (e) {
             const step = e.target.value;
             // Set exact min-width via CSS variable
-            assetGrid.style.setProperty('--card-min-width', snapWidths[step]);
-            localStorage.setItem('vt_zoom_step', step);
+            assetGrid.style.setProperty('--card-min-width', ZOOM_SNAP_WIDTHS[step]);
+            // Remember the choice for the currently selected category
+            setCategoryZoom(selectedCategory, step);
         });
     }
 
-    // Bottom toolbar: Aspect ratio toggle
+    // Bottom toolbar: Aspect ratio toggle (stored per category/group)
     const aspectBtns = document.querySelectorAll('.aspect-btn');
     aspectBtns.forEach(btn => {
         btn.addEventListener('click', function () {
@@ -1448,8 +2065,13 @@ function setupEventListenersContinued() {
             // Update card thumbnails aspect ratio
             const aspect = btn.dataset.aspect;
             document.documentElement.style.setProperty('--card-aspect', aspect === '9:16' ? '9/16' : '16/9');
+            // Remember the choice for the currently selected category
+            setCategoryAspect(selectedCategory, aspect);
         });
     });
+
+    // Restore aspect for the initial category
+    applyCategoryAspect(selectedCategory);
 }
 
 /**
@@ -1615,24 +2237,54 @@ function resetAssetTypes() {
 function showSaveDialog() {
     setStatus('Checking selection...');
 
-    // Check if there's a selection in Premiere
-    csInterface.evalScript('VT_hasSelection()', function (result) {
-        if (result === 'true') {
+    // Check if there's a selection in Premiere (and whether it is all MOGRTs,
+    // e.g. titles dropped in by AtomX - v3.9.0)
+    csInterface.evalScript('VT_getSelectionInfo()', function (result) {
+        let info = null;
+        try { info = JSON.parse(result); } catch (e) { info = null; }
+        if (!info) {
+            // Host script older than 3.9.0 still cached - plain selection check
+            csInterface.evalScript('VT_hasSelection()', function (r2) {
+                openSaveDialogFor({ hasSelection: r2 === 'true' });
+            });
+            return;
+        }
+        openSaveDialogFor(info);
+    });
+
+    function openSaveDialogFor(info) {
+        if (info && info.hasSelection) {
             resetAssetTypes();
             saveDialog.style.display = 'flex';
             populateSubcategories();
+            assetNameInput.disabled = false;
+            assetNameInput.placeholder = 'Asset name...';
+            const batchNoteEl = document.getElementById('importBatchNote');
+            if (batchNoteEl) batchNoteEl.style.display = 'none';
             assetNameInput.value = '';
-            assetNameInput.focus();
 
             // Initialize custom select
             initCustomSelect();
+
+            // MOGRT selection: preselect the MOGRT type and suggest the
+            // template's name so saving is a single Enter press.
+            if (info.kind === 'mogrt') {
+                const mogrtOpt = document.querySelector('.custom-option[data-value="mogrt"]');
+                if (mogrtOpt) mogrtOpt.click();
+                if (info.name) {
+                    assetNameInput.value = info.name;
+                    assetNameInput.select();
+                }
+                addLog('Save: MOGRT selection detected (' + info.count + ' clip(s))', 'info');
+            }
+            assetNameInput.focus();
 
             setStatus('Enter asset name');
         } else {
             setStatus('No clips selected! Select clips on timeline first.');
             setTimeout(() => setStatus('Ready'), 3000);
         }
-    });
+    }
 }
 
 /**
@@ -1640,6 +2292,10 @@ function showSaveDialog() {
  */
 function hideSaveDialog() {
     saveDialog.style.display = 'none';
+    assetNameInput.disabled = false;
+    assetNameInput.placeholder = 'Asset name...';
+    const batchNoteEl = document.getElementById('importBatchNote');
+    if (batchNoteEl) batchNoteEl.style.display = 'none';
     setStatus('Ready');
 }
 
@@ -1685,71 +2341,136 @@ function showDuplicateDialog(assetName) {
 }
 
 /**
+ * Open the save/import dialog for a list of external files.
+ * With a single file the asset name is editable; with several files
+ * names are taken from filenames and type/subcategory apply to all.
+ */
+function openImportDialog(filePaths) {
+    if (!filePaths || !filePaths.length) return;
+    pendingImportFiles = filePaths;
+    const isBatch = filePaths.length > 1;
+
+    saveDialog.style.display = 'flex';
+    initCustomSelect();
+    populateSubcategories();
+
+    // Auto-detect type from the first file (images have no dedicated option -> Overlay)
+    const autoType = detectTypeFromExtension(filePaths[0]);
+    const optionType = autoType === 'image' ? 'overlay' : autoType;
+    const targetOption = Array.from(document.querySelectorAll('.custom-option')).find(el => el.dataset.value === optionType);
+    if (targetOption) targetOption.click();
+    filterAssetTypes(autoType);
+    populateSubcategories(optionType);
+
+    // Batch note
+    const batchNote = document.getElementById('importBatchNote');
+    if (batchNote) {
+        if (isBatch) {
+            batchNote.textContent = 'Batch import: ' + filePaths.length +
+                ' files \u2014 names will be taken from filenames; type and subcategory apply to all.';
+            batchNote.style.display = 'block';
+        } else {
+            batchNote.style.display = 'none';
+        }
+    }
+
+    if (isBatch) {
+        assetNameInput.disabled = true;
+        assetNameInput.value = '';
+        assetNameInput.placeholder = '(names from filenames)';
+    } else {
+        assetNameInput.disabled = false;
+        assetNameInput.placeholder = 'Asset name...';
+        assetNameInput.value = path.basename(filePaths[0], path.extname(filePaths[0]));
+        assetNameInput.focus();
+    }
+}
+
+/**
  * Confirm and save asset
  * Uses copy/paste workflow to preserve effects
- * Or imports external file if pendingImportFile is set
+ * Or imports external file(s) if pendingImportFiles is set
  */
 async function confirmSaveAsset() {
     const name = assetNameInput.value.trim();
     const subcat = document.getElementById('assetSubcategory') ? document.getElementById('assetSubcategory').value.trim() : '';
     const type = assetTypeSelect ? assetTypeSelect.value : 'other';
+    const isBatchImport = pendingImportFiles.length > 1;
 
-    if (!name) {
+    if (!name && !isBatchImport) {
         assetNameInput.focus();
         return;
     }
 
-    // Check for duplicate name
-    const existingAsset = assets.find(a => a.name.toLowerCase() === name.toLowerCase());
-    if (existingAsset) {
-        const shouldContinue = await showDuplicateDialog(name);
-        if (!shouldContinue) {
-            assetNameInput.focus();
-            assetNameInput.select();
-            return;
+    // Check for duplicate name (single import only; batch skips the dialog)
+    if (!isBatchImport) {
+        const existingAsset = assets.find(a => a.name.toLowerCase() === name.toLowerCase());
+        if (existingAsset) {
+            const shouldContinue = await showDuplicateDialog(name);
+            if (!shouldContinue) {
+                assetNameInput.focus();
+                assetNameInput.select();
+                return;
+            }
         }
     }
 
     hideSaveDialog();
+    assetNameInput.disabled = false;
+    assetNameInput.placeholder = 'Asset name...';
 
     // Check if this is an import (external file) or save (from timeline)
-    if (pendingImportFile) {
-        // IMPORT external file
-        setStatus('Importing file...');
-        addLog('=== Importing File: ' + name + ' (' + type + ') ===', 'info');
+    if (pendingImportFiles.length) {
+        // IMPORT external file(s)
+        const files = pendingImportFiles;
+        pendingImportFiles = [];
+        setStatus('Importing ' + files.length + ' file' + (files.length > 1 ? 's' : '') + '...');
+        addLog('=== Importing ' + files.length + ' file(s) (' + type + ') ===', 'info');
 
-        const assetId = 'asset_' + Date.now();
-        const ext = path.extname(pendingImportFile);
-        const assetPath = path.join(ASSETS_DIR, assetId + ext);
+        let okCount = 0;
+        let failCount = 0;
 
-        try {
-            // Copy file to assets folder
-            fs.copyFileSync(pendingImportFile, assetPath);
-            addLog('Copied to: ' + assetPath);
+        for (let i = 0; i < files.length; i++) {
+            const srcPath = files[i];
+            const fileBase = path.basename(srcPath, path.extname(srcPath));
+            // Single file: user-chosen name; batch: filename
+            const finalName = files.length > 1 ? fileBase : name;
 
-            // Save metadata
-            const metadata = {
-                id: assetId,
-                name: name,
-                subcategory: subcat || undefined,
-                type: type,
-                path: assetPath,
-                isExternal: true, // Mark as imported (not .prproj)
-                created: new Date().toISOString()
-            };
+            const assetId = 'asset_' + Date.now() + (files.length > 1 ? '_' + i : '');
+            const ext = path.extname(srcPath);
+            const assetPath = path.join(ASSETS_DIR, assetId + ext);
 
-            const metaPath = path.join(ASSETS_DIR, assetId + '.json');
-            fs.writeFileSync(metaPath, JSON.stringify(metadata, null, 2));
-            assets.push(metadata);
-            renderAssets();
-            setStatus('Imported: ' + name);
-            addLog('=== SUCCESS! ===');
-        } catch (err) {
-            addLog('Import error: ' + err, 'error');
-            setStatus('Import failed!');
+            try {
+                fs.copyFileSync(srcPath, assetPath);
+
+                const metadata = {
+                    id: assetId,
+                    name: finalName,
+                    subcategory: subcat || undefined,
+                    type: type,
+                    path: assetPath,
+                    isExternal: true, // Mark as imported (not .prproj)
+                    created: new Date().toISOString()
+                };
+
+                const metaPath = path.join(ASSETS_DIR, assetId + '.json');
+                fs.writeFileSync(metaPath, JSON.stringify(metadata, null, 2));
+                assets.push(metadata);
+                okCount++;
+            } catch (err) {
+                addLog('Import error (' + srcPath + '): ' + err, 'error');
+                failCount++;
+            }
         }
 
-        pendingImportFile = null;
+        renderAssets();
+        if (failCount === 0) {
+            setStatus('Imported: ' + okCount + ' file' + (okCount > 1 ? 's' : ''));
+            addLog('=== SUCCESS! Imported ' + okCount + ' ===');
+        } else {
+            setStatus('Imported ' + okCount + ', failed ' + failCount);
+            addLog('=== Done with errors: ' + okCount + ' ok, ' + failCount + ' failed ===', 'error');
+        }
         return;
     }
 
@@ -1759,6 +2480,7 @@ async function confirmSaveAsset() {
 
     // Generate unique ID
     const assetId = 'asset_' + Date.now();
+
     const assetPath = path.join(ASSETS_DIR, assetId + '.prproj');
     const escapedPath = assetPath.replace(/\\/g, '\\\\');
 
@@ -1775,7 +2497,7 @@ async function confirmSaveAsset() {
         }
 
         // Play warning beep
-        playBeep('start');
+        if (!isAssetSoundDisabled()) playBeep('start');
 
         // Show status that we're generating preview (UI may freeze during render)
         setStatus('Saving & generating preview...');
@@ -1787,14 +2509,39 @@ async function confirmSaveAsset() {
             savingSubtext.textContent = 'Rendering 480p preview, this may take a few seconds';
         }
 
-        const result = await evalScriptAsync(`VT_saveAssetNative("${escapedPath}")`);
-        addLog('Result: ' + result);
+        // MOGRT selection: native save - no clipboard, no sequence opened
+        // (v3.9.3). Anything else (or keyframed MOGRTs) uses the classic save.
+        let parsed = null;
+        try {
+            const nr = await evalScriptAsync(`VT_saveMogrtAsset("${escapedPath}")`);
+            const nd = JSON.parse(nr);
+            if (nd.success) {
+                parsed = nd;
+                addLog('Saved as native MOGRT asset (' + nd.meta.clips.length + ' clip(s))', 'success');
+            } else if (nd.fallback) {
+                addLog('Native MOGRT save not possible (' + (nd.reason || '?') + ') - classic save', 'info');
+            } else {
+                throw new Error(nd.error || 'Save failed');
+            }
+        } catch (nativeErr) {
+            if (nativeErr && nativeErr.message && !/JSON|Unexpected/i.test(nativeErr.message)) throw nativeErr;
+        }
 
-        // Parse result
-        const parsed = JSON.parse(result);
+        if (!parsed) {
+            // Classic save: move OS focus to Premiere first so the DLL
+            // copy/paste (SendInput) land although save started in the panel.
+            runFocusFix();
+            const result = await evalScriptAsync(`VT_saveAssetNative("${escapedPath}")`);
+            addLog('Result: ' + result);
+            parsed = JSON.parse(result);
+            if (parsed.success) {
+                addLog('Copy: ' + parsed.copyResult + ', Paste: ' + parsed.pasteResult);
+                // Save's DLL paste succeeded = timeline had focus. Remember HWND.
+                rememberTimelineFocus();
+            }
+        }
 
         if (parsed.success) {
-            addLog('Copy: ' + parsed.copyResult + ', Paste: ' + parsed.pasteResult);
 
             // Log preview status
             if (parsed.previewGenerated) {
@@ -1812,6 +2559,9 @@ async function confirmSaveAsset() {
                 path: assetPath,
                 created: new Date().toISOString()
             };
+            // Native MOGRT description (template + values): inserts need no
+            // clipboard and open no sequence
+            if (parsed.isNative && parsed.meta) metadata.mogrtNative = parsed.meta;
 
             const metaPath = path.join(ASSETS_DIR, assetId + '.json');
             fs.writeFileSync(metaPath, JSON.stringify(metadata, null, 2));
@@ -1821,14 +2571,14 @@ async function confirmSaveAsset() {
             const previewMsg = parsed.previewGenerated ? ' (with preview)' : '';
             setStatus('Asset saved: ' + name + previewMsg);
             addLog('=== SUCCESS! ===');
-            playBeep('success');
+            if (!isAssetSoundDisabled()) playBeep('success');
         } else {
             throw new Error(parsed.error || 'Save failed');
         }
     } catch (error) {
         addLog('ERROR: ' + error.message, 'error');
         setStatus('Error saving asset');
-        playBeep('error');
+        if (!isAssetSoundDisabled()) playBeep('error');
     } finally {
         // Always hide overlay
         const savingOverlay = document.getElementById('savingOverlay');
@@ -1841,6 +2591,329 @@ async function confirmSaveAsset() {
 /**
  * Load assets from disk
  */
+// ===================== PRESETS (clip property presets) =====================
+// A preset stores ALL properties of ALL effects (components) of the selected
+// clip - Motion, Opacity, Graphic Parameters, MOGRT sliders, etc. Applying
+// a preset restores every property on the selected clip (Premiere Composer
+// style). No clips are saved, no .prproj files - only property values.
+let presets = [];
+let currentClipKey = '';
+let currentClipInfo = null;
+
+async function refreshCurrentClipKey() {
+    try {
+        const res = await evalScriptAsync('VT_getSelectedClipKey()');
+        const parsed = JSON.parse(res);
+        if (parsed && parsed.success) {
+            currentClipKey = parsed.clipKey || '';
+            currentClipInfo = { kind: parsed.kind || '', name: parsed.clipName || '', mediaType: parsed.mediaType || '' };
+        } else {
+            currentClipKey = '';
+            currentClipInfo = null;
+        }
+    } catch (e) { currentClipKey = ''; currentClipInfo = null; }
+    renderPresetTarget();
+}
+
+const PRESET_KIND_LABEL = { mogrt: 'MOGRT', video: 'Video', image: 'Image', audio: 'Audio', sequence: 'Nest', clip: 'Clip' };
+const PRESET_IMAGE_RE = /\.(jpe?g|png|gif|bmp|tiff?|psd|ai|eps|webp|heic|tga|exr|dpx)$/i;
+
+// Kind of clip a preset belongs to (older presets carry no "kind" field)
+function presetKind(p) {
+    if (p.kind && PRESET_KIND_LABEL[p.kind]) return p.kind;
+    const key = p.clipKey || '';
+    if (isTemplateKey(key)) return 'mogrt';
+    if (key.indexOf('seq:') === 0) return 'sequence';
+    const fx = (p.effects || []).map(function (e) { return e.matchName || ''; });
+    const isVideo = fx.indexOf('AE.ADBE Motion') !== -1 || fx.indexOf('AE.ADBE Opacity') !== -1;
+    if (key.indexOf('mp:') === 0) {
+        if (!isVideo && fx.length) return 'audio';
+        return PRESET_IMAGE_RE.test(key) ? 'image' : 'video';
+    }
+    return 'clip';
+}
+
+function renderPresetTarget() {
+    const el = document.getElementById('presetTarget');
+    if (!el) return;
+    el.innerHTML = '';
+    if (!currentClipKey || !currentClipInfo) {
+        el.textContent = 'Select a clip on the timeline (MOGRT, video, image or audio)';
+        el.title = '';
+        return;
+    }
+    const tag = document.createElement('span');
+    tag.className = 'preset-tag';
+    tag.textContent = PRESET_KIND_LABEL[currentClipInfo.kind] || 'Clip';
+    el.appendChild(tag);
+    el.appendChild(document.createTextNode(currentClipInfo.name || ''));
+    el.title = 'Presets are saved for and shown only with this ' +
+        (currentClipInfo.kind === 'mogrt' ? 'template' : (currentClipInfo.kind === 'sequence' ? 'nested sequence' : 'media file'));
+}
+
+function totalPresetProps(preset) {
+    let n = 0;
+    if (preset.effects) preset.effects.forEach(function (fx) { n += fx.properties ? fx.properties.length : 0; });
+    return n;
+}
+
+// Every preset belongs to the clip it was saved from: a MOGRT preset to its
+// template, a preset of a video/image/audio clip to that media file. The list
+// shows only the selected clip's presets and they apply only to such clips.
+function isTemplateKey(key) {
+    return typeof key === 'string' && key.indexOf('mgt') === 0;
+}
+
+// Apply options (chips in the menu), remembered per panel
+const PRESET_OPT_KEYS = ['text', 'motion', 'opacity', 'addMissing'];
+function getPresetOptions() {
+    let o = {};
+    try { o = JSON.parse(localStorage.getItem('vt_preset_opts') || '{}') || {}; } catch (e) { o = {}; }
+    const out = {};
+    PRESET_OPT_KEYS.forEach(function (k) { out[k] = o[k] !== false; });
+    return out;
+}
+function setPresetOption(key, on) {
+    const o = getPresetOptions();
+    o[key] = !!on;
+    try { localStorage.setItem('vt_preset_opts', JSON.stringify(o)); } catch (e) { /* storage unavailable */ }
+}
+function syncPresetOptionChips() {
+    const o = getPresetOptions();
+    document.querySelectorAll('.preset-opt').forEach(function (b) {
+        b.setAttribute('aria-pressed', o[b.dataset.opt] ? 'true' : 'false');
+    });
+}
+
+function loadPresets() {
+    presets = [];
+    try {
+        if (!fs.existsSync(PRESETS_DIR)) fs.mkdirSync(PRESETS_DIR, { recursive: true });
+        fs.readdirSync(PRESETS_DIR, { withFileTypes: true }).forEach(function (ent) {
+            const full = path.join(PRESETS_DIR, ent.name);
+            if (ent.isFile() && ent.name.endsWith('.json')) {
+                try {
+                    const p = JSON.parse(fs.readFileSync(full, 'utf8'));
+                    if (p && p.name && p.effects) { p._file = full; presets.push(p); }
+                } catch (e) { addLog('loadPresets: bad preset file ' + ent.name, 'warning'); }
+            } else if (ent.isDirectory()) {
+                // Older single-effect presets (presets/<effect>/preset_*.json):
+                // shown again as presets with one effect.
+                try {
+                    fs.readdirSync(full).forEach(function (file) {
+                        if (!file.endsWith('.json')) return;
+                        try {
+                            const q = JSON.parse(fs.readFileSync(path.join(full, file), 'utf8'));
+                            if (!q || !q.properties || !q.effectMatchName) return;
+                            presets.push({
+                                id: q.id || file.replace(/\.json$/, ''),
+                                name: q.name || file,
+                                clipName: q.clipName || '',
+                                clipKey: '',
+                                effects: [{ matchName: q.effectMatchName, displayName: q.effectDisplayName || q.effectMatchName, properties: q.properties }],
+                                created: q.created || '',
+                                legacyEffect: q.effectDisplayName || q.effectMatchName,
+                                _file: path.join(full, file)
+                            });
+                        } catch (e2) { addLog('loadPresets: bad preset file ' + file, 'warning'); }
+                    });
+                } catch (e3) { /* unreadable folder */ }
+            }
+        });
+        renderPresetList();
+    } catch (e) {
+        addLog('loadPresets error: ' + e.message, 'error');
+    }
+}
+
+function renderPresetList() {
+    const list = document.getElementById('presetList');
+    if (!list) return;
+    list.innerHTML = '';
+    let visible = presets;
+    if (currentClipKey) {
+        // Only this clip's / this template's own presets (plus old ones without a key)
+        visible = presets.filter(function (p) { return !p.clipKey || p.clipKey === currentClipKey; });
+    }
+    if (!visible.length) {
+        const empty = document.createElement('div');
+        empty.className = 'preset-empty';
+        empty.textContent = currentClipKey
+            ? 'No presets for the selected clip. Save one from this clip first.'
+            : 'No presets yet. Select a MOGRT, video, image or audio clip, tune its settings and press Save.';
+        list.appendChild(empty);
+        return;
+    }
+    visible.slice().sort(function (a, b) { return (b.created || '').localeCompare(a.created || ''); })
+        .forEach(function (p) {
+            const row = document.createElement('div');
+            row.className = 'preset-row';
+
+            const info = document.createElement('div');
+            info.className = 'preset-info';
+            info.style.flex = '1';
+            const nm = document.createElement('div');
+            nm.className = 'preset-name';
+            nm.textContent = p.name;
+            const sub = document.createElement('div');
+            sub.className = 'preset-sub';
+            let dateStr = '';
+            if (p.created) {
+                try { dateStr = new Date(p.created).toLocaleDateString(); } catch (e) {}
+            }
+            const fxNames = (p.effects || []).map(function (fx) { return fx.displayName || fx.matchName || '?'; });
+            const fxText = fxNames.slice(0, 3).join(', ') + (fxNames.length > 3 ? ' +' + (fxNames.length - 3) : '');
+            if (p.clipKey || p.legacyEffect) {
+                const tag = document.createElement('span');
+                tag.className = 'preset-tag';
+                tag.textContent = p.legacyEffect ? 'Effect' : (PRESET_KIND_LABEL[presetKind(p)] || 'Clip');
+                nm.insertBefore(tag, nm.firstChild);
+            }
+            sub.textContent = (p.clipName ? p.clipName + ' | ' : '') + fxText + (dateStr ? ' | ' + dateStr : '');
+            row.title = 'Apply to the selected clip(s): ' + fxNames.join(', ') + ' (' + totalPresetProps(p) + ' properties)';
+            info.appendChild(nm);
+            info.appendChild(sub);
+
+            const actions = document.createElement('div');
+            actions.className = 'preset-actions';
+
+            const applyBtn = document.createElement('button');
+            applyBtn.className = 'preset-act';
+            applyBtn.title = 'Apply all preset settings to the selected clip';
+            applyBtn.innerHTML = '<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>';
+            applyBtn.onclick = function (e) { e.stopPropagation(); loadPreset(p); };
+
+            const delBtn = document.createElement('button');
+            delBtn.className = 'preset-act preset-act-danger';
+            delBtn.title = 'Delete preset';
+            delBtn.innerHTML = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>';
+            delBtn.onclick = function (e) { e.stopPropagation(); deletePreset(p); };
+
+            actions.appendChild(applyBtn);
+            actions.appendChild(delBtn);
+
+            row.appendChild(info);
+            row.appendChild(actions);
+            row.ondblclick = function () { loadPreset(p); };
+
+            list.appendChild(row);
+        });
+}
+
+async function savePresetFromSelection() {
+    const nameInput = document.getElementById('presetNameInput');
+    const name = nameInput ? nameInput.value.trim() : '';
+    if (!name) { if (nameInput) nameInput.focus(); return; }
+
+    const existing = presets.find(function (p) { return p.name.toLowerCase() === name.toLowerCase(); });
+    if (existing) {
+        if (!window.confirm('Preset "' + name + '" already exists. Overwrite?')) return;
+    }
+
+    try {
+        // Snapshot ALL effects and ALL properties of the selected clip
+        const res = await evalScriptAsync('VT_getSelectedClipEffects()');
+        const parsed = JSON.parse(res);
+        if (!parsed || !parsed.success) throw new Error((parsed && parsed.error) || 'Could not read the selected clip');
+        if (!parsed.effects || !parsed.effects.length) throw new Error('Selected clip has no effects');
+
+        // Overwrite = replace the old preset (it used to be kept as a duplicate)
+        const presetId = (existing && !existing.legacyEffect && existing.id) ? existing.id : 'preset_' + Date.now();
+        const metadata = {
+            id: presetId,
+            name: name,
+            clipName: parsed.clipName || '',
+            isMGT: !!parsed.isMGT,
+            clipKey: parsed.clipKey || '',
+            kind: parsed.kind || '',
+            mediaType: parsed.mediaType || '',
+            effects: parsed.effects,
+            created: new Date().toISOString()
+        };
+        const newFile = path.join(PRESETS_DIR, presetId + '.json');
+        const toWrite = Object.assign({}, metadata);
+        delete toWrite._file;
+        fs.writeFileSync(newFile, JSON.stringify(toWrite, null, 2));
+        metadata._file = newFile;
+        if (existing) {
+            if (existing._file && existing._file !== newFile) { try { fs.unlinkSync(existing._file); } catch (e) { /* already gone */ } }
+            presets = presets.filter(function (p) { return p !== existing; });
+        }
+        presets.push(metadata);
+        // The list follows the clip the preset was just read from
+        currentClipKey = metadata.clipKey;
+        currentClipInfo = { kind: metadata.kind, name: metadata.clipName, mediaType: metadata.mediaType };
+        renderPresetTarget();
+        renderPresetList();
+        if (nameInput) nameInput.value = '';
+        const kindLabel = PRESET_KIND_LABEL[presetKind(metadata)] || 'Clip';
+        setStatus('Preset saved: ' + name + ' (' + kindLabel + ')');
+        addLog('Preset saved: "' + name + '" for ' + kindLabel + ' "' + metadata.clipName + '" (' + parsed.effects.length + ' effects, ' + totalPresetProps(metadata) + ' properties)', 'success');
+        if (!isPresetSoundDisabled()) playBeep('success');
+    } catch (err) {
+        addLog('Preset save error: ' + err.message, 'error');
+        setStatus('Error saving preset');
+        if (!isPresetSoundDisabled()) playBeep('error');
+    }
+}
+
+async function loadPreset(preset) {
+    if (!preset || !preset.effects) return;
+    setStatus('Applying preset "' + preset.name + '"...');
+    addLog('=== Apply preset: ' + preset.name + ' (' + preset.effects.length + ' effects, ' + totalPresetProps(preset) + ' properties) ===', 'info');
+    try {
+        if (!(await ensureHostScript())) throw new Error('Host script not loaded');
+        const opts = getPresetOptions();
+        const payload = JSON.stringify({
+            effects: preset.effects,
+            clipKey: preset.clipKey || '',
+            mediaType: preset.mediaType || '',
+            options: opts
+        });
+        // fresh group: a start left over from a cancelled insert must not be reused
+        await beginUndoGroup(true);
+        const result = await evalScriptAsync('VT_applyEffectPreset(' + JSON.stringify(payload) + ')');
+        await endUndoGroup();
+
+        let parsed = null;
+        try { parsed = JSON.parse(result); } catch (pe) {}
+        if (parsed && parsed.success) {
+            let msg = 'Preset applied: ' + preset.name + ' (' + parsed.appliedProps + ' properties';
+            if (parsed.addedEffects) msg += ', ' + parsed.addedEffects + ' effect(s) added';
+            if (parsed.keptTexts) msg += ', own text kept';
+            if (parsed.missingProps && parsed.missingProps.length) msg += ', ' + parsed.missingProps.length + ' missing';
+            msg += ')';
+            if (parsed.missingProps && parsed.missingProps.length) addLog('Not applied: ' + parsed.missingProps.join(', '), 'warning');
+            setStatus(msg);
+            addLog('=== ' + msg + ' ===', 'success');
+            if (!isPresetSoundDisabled()) playBeep('success');
+            const menu = document.getElementById('presetsMenu');
+            if (menu) menu.classList.remove('show');
+            setTimeout(function () { setStatus('Ready'); }, 2000);
+        } else {
+            throw new Error((parsed && parsed.error) || result || 'Apply failed');
+        }
+    } catch (err) {
+        addLog('Preset apply error: ' + err.message, 'error');
+        setStatus('Error applying preset');
+        if (!isPresetSoundDisabled()) playBeep('error');
+        try { await evalScriptAsync('VT_cancelUndoGroup()'); } catch (e) { /* ignore */ }
+    }
+}
+
+async function deletePreset(preset) {
+    if (!preset) return;
+    try {
+        const jsonPath = preset._file || path.join(PRESETS_DIR, preset.id + '.json');
+        if (fs.existsSync(jsonPath)) fs.unlinkSync(jsonPath);
+        presets = presets.filter(function (p) { return p.id !== preset.id; });
+        renderPresetList();
+        setStatus('Preset deleted: ' + preset.name);
+        addLog('Preset deleted: ' + preset.name, 'info');
+    } catch (err) {
+        addLog('Preset delete error: ' + err.message, 'error');
+    }
+}
 function loadAssets() {
     assets = [];
     addLog('loadAssets: Loading assets from ' + ASSETS_DIR, 'info');
@@ -1861,13 +2934,11 @@ function loadAssets() {
                     const content = fs.readFileSync(metaPath, 'utf8');
                     const metadata = JSON.parse(content);
 
-                    addLog('loadAssets: Processing JSON file: ' + file + ' for asset: ' + metadata.name, 'info');
 
                     // Check if .prproj file or external file exists
                     let fileExists = false;
                     if (metadata.path) {
                         fileExists = fs.existsSync(metadata.path);
-                        addLog('loadAssets: Checking path: ' + metadata.path + ' -> ' + fileExists, 'info');
                     } else {
                         addLog('loadAssets: Asset ' + metadata.name + ' has no path in metadata!', 'warning');
                     }
@@ -1900,7 +2971,7 @@ function detectTypeFromExtension(filepath) {
     const ext = path.extname(filepath).toLowerCase();
     if (['.mp3', '.wav', '.aac', '.m4a', '.aif', '.aiff'].includes(ext)) return 'audio';
     if (['.mp4', '.mov', '.mxf', '.avi', '.mpg', '.webm', '.mkv'].includes(ext)) return 'video';
-    if (['.png', '.jpg', '.jpeg', '.tiff', '.webp', '.bmp', '.psd', '.ai'].includes(ext)) return 'image'; // mapped to image/overlay
+    if (['.png', '.jpg', '.jpeg', '.gif', '.tif', '.tiff', '.webp', '.bmp', '.psd', '.ai'].includes(ext)) return 'image'; // mapped to image/overlay
     if (ext === '.mogrt') return 'mogrt';
     return 'other';
 }
@@ -1982,25 +3053,16 @@ function renderFilterChips(categoryAssets) {
 
             item.addEventListener('click', (e) => {
                 e.stopPropagation();
-                // Multi-select toggle logic
-                if (cat === 'All') { // Should not happen in hidden usually
-                    activeSubcategory.clear();
-                    activeSubcategory.add('All');
+                // Single-select switch: click selects cat as the only filter,
+                // clicking the active item again resets to All
+                if (cat === 'All') {
+                    activeSubcategory = new Set(['All']);
+                } else if (activeSubcategory.has(cat)) {
+                    activeSubcategory = new Set(['All']);
                 } else {
-                    if (activeSubcategory.has('All')) activeSubcategory.delete('All');
-
-                    if (activeSubcategory.has(cat)) {
-                        activeSubcategory.delete(cat);
-                        if (activeSubcategory.size === 0) activeSubcategory.add('All');
-                    } else {
-                        activeSubcategory.add(cat);
-                    }
+                    activeSubcategory = new Set([cat]);
                 }
-                // Keep dropdown open for multi-select? Maybe better UX.
-                // Or close it? User asked for multi-select. Usually dropdowns close.
-                // But for filters, keeping open is nice. Let's keep it open but update UI.
-                // Actually, re-rendering renders everything including closing logic.
-                // If we renderAssets(), it rebuilds the whole bar.
+                // renderAssets() rebuilds the filter bar, which closes the dropdown
                 renderAssets();
             });
 
@@ -2061,19 +3123,14 @@ function createFilterChip(cat, categoryAssets) {
     chip.innerHTML = `<span class="chip-label">${cat}</span><span class="chip-count">${count}</span>`;
 
     chip.addEventListener('click', () => {
-        // Toggle logic
+        // Single-select switch: click selects cat as the only filter,
+        // clicking the active chip again resets to All
         if (cat === 'All') {
-            activeSubcategory.clear();
-            activeSubcategory.add('All');
+            activeSubcategory = new Set(['All']);
+        } else if (activeSubcategory.has(cat)) {
+            activeSubcategory = new Set(['All']);
         } else {
-            if (activeSubcategory.has('All')) activeSubcategory.delete('All');
-
-            if (activeSubcategory.has(cat)) {
-                activeSubcategory.delete(cat);
-                if (activeSubcategory.size === 0) activeSubcategory.add('All');
-            } else {
-                activeSubcategory.add(cat);
-            }
+            activeSubcategory = new Set([cat]);
         }
         renderAssets();
     });
@@ -2551,6 +3608,7 @@ function createAssetCard(asset) {
     const hasPreviewFile = hasPreview(asset);
     const isAudio = isAudioFile(asset.path);
     const isMogrt = isMogrtFile(asset.path);
+    const isImage = isImageFile(asset.path);
 
     // Selection State
     if (selectedAssetIds.has(asset.id)) {
@@ -2608,11 +3666,26 @@ function createAssetCard(asset) {
         }
 
         // Show Audio Preview for audio files (if single or last selected)
+        const isVideoFileAsset = isVideoFile(asset.path);
         if (isAudio && AudioPreview) {
-            AudioPreview.show(asset);
+            if (VideoPreview) VideoPreview.hide();
+            if (isAutoPlayAudioEnabled()) {
+                AudioPreview.showAndPlay(asset);
+            } else {
+                AudioPreview.show(asset);
+            }
+        } else if (isVideoFileAsset && VideoPreview && !isMulti && !isRange) {
+            // Show Video Preview for video files (single click)
+            if (AudioPreview) AudioPreview.hide();
+            if (isAutoPlayAudioEnabled()) {
+                VideoPreview.showAndPlay(asset);
+            } else {
+                VideoPreview.show(asset);
+            }
         } else if (AudioPreview && !isMulti && !isRange) {
             // If we clicked a non-audio asset (single click), hide preview
             if (!isAudio) AudioPreview.hide();
+            if (VideoPreview) VideoPreview.hide();
         }
 
         // Update Status
@@ -2630,7 +3703,7 @@ function createAssetCard(asset) {
 
     card.setAttribute('draggable', 'true');
     card.dataset.assetId = asset.id;
-    card.dataset.assetPath = asset.path;
+    card.dataset.assetPath = asset.path || '';
     card.dataset.assetType = asset.type || 'other';
 
     // Detect icon by extension for special file types (isAudio/isMogrt already computed at top)
@@ -2640,11 +3713,13 @@ function createAssetCard(asset) {
         icon = '📊'; // MOGRT icon
     } else if (isAudio) {
         icon = '🎵'; // Audio icon
+    } else if (isImage) {
+        icon = '🖼️'; // Image icon
     } else {
         icon = getAssetIcon(asset.type);
     }
 
-    const previewPath = getPreviewPath(asset.path);
+    const previewPath = asset.path ? getPreviewPath(asset.path) : null;
     // hasPreviewFile was already calculated above
 
     const typeLabel = TYPE_LABELS[asset.type] || 'Asset';
@@ -2654,7 +3729,10 @@ function createAssetCard(asset) {
     let thumbnailContent;
     let needsWaveformSetup = false;
 
-    if (hasPreviewFile) {
+    if (isImage && isImagePreviewable(asset.path)) {
+        // The image itself is the preview (browser-decodable formats)
+        thumbnailContent = `<img class="asset-preview asset-image" src="file://${asset.path}" alt="">`;
+    } else if (hasPreviewFile) {
         // Lazy: video src is set by IntersectionObserver when card enters viewport
         thumbnailContent = `<video class="asset-preview" data-lazy-src="file://${previewPath}" loop muted playsinline preload="metadata"></video>`;
     } else if (isAudio) {
@@ -2783,32 +3861,74 @@ function createAssetCard(asset) {
     });
 
     // Double-click to apply asset at playhead
-    card.addEventListener('dblclick', function (e) {
+    card.addEventListener('dblclick', async function (e) {
         e.preventDefault();
-        applyAsset(asset);
+        // One insert at a time: a second double-click while the first insert
+        // runs used to interleave both and mix up the clipboard.
+        if (window._vtInserting) {
+            addLog('Insert already in progress - double-click ignored', 'warning');
+            return;
+        }
+        window._vtInserting = true;
+        try {
+            await applyAsset(asset);
+        } catch (err) {
+            /* already logged and shown in the status bar by applyAsset */
+        } finally {
+            window._vtInserting = false;
+        }
     });
 
     // Hover to play video preview (works with lazy-loaded src)
-    const videoEl = card.querySelector('.asset-preview');
+    const videoEl = card.querySelector('video.asset-preview');
     if (videoEl) {
         // When metadata loads, seek to 25% for thumbnail (avoids black frames from fade-in effects)
         videoEl.addEventListener('loadedmetadata', function () {
+            // Skip if the preview bar owns this element (fresh click playback).
+            // No isOpen() check: ownership is set before the 'visible'
+            // class lands, and metadata can resolve within that frame.
+            if (typeof VideoPreview !== 'undefined' &&
+                VideoPreview.playbackEl === videoEl) {
+                return;
+            }
             const thumbnailPos = videoEl.duration * 0.25;
             videoEl.currentTime = thumbnailPos;
         });
 
+        // Hover plays the thumbnail preview - except for the card currently
+        // owned by the preview bar (playing OR paused after a click).
+        // Only ONE hover video decodes at a time, and none while the main
+        // preview-bar video plays (extra decoders cause stutter).
         card.addEventListener('mouseenter', function () {
-            // Only play if src has been loaded by the lazy observer
             if (!videoEl.src) return;
+            // Selected card: the preview bar drives it - don't interfere
+            if (typeof VideoPreview !== 'undefined' && VideoPreview.isOpen() &&
+                VideoPreview.playbackEl === videoEl) {
+                return;
+            }
+            // Main video playing: no extra decoders
+            if (typeof VideoPreview !== 'undefined' && VideoPreview.isPlaying) {
+                return;
+            }
+            // Pause the previous hover preview
+            if (_hoverVideoEl && _hoverVideoEl !== videoEl) {
+                try { _hoverVideoEl.pause(); } catch (e) {}
+            }
+            _hoverVideoEl = videoEl;
             videoEl.currentTime = 0;
             videoEl.play().catch(() => { });
         });
         card.addEventListener('mouseleave', function () {
             if (!videoEl.src) return;
+            if (typeof VideoPreview !== 'undefined' && VideoPreview.isOpen() &&
+                VideoPreview.playbackEl === videoEl) {
+                return;
+            }
             videoEl.pause();
+            if (_hoverVideoEl === videoEl) _hoverVideoEl = null;
             // Return to 25% position for thumbnail
             const thumbnailPos = videoEl.duration ? videoEl.duration * 0.25 : 0;
-            videoEl.currentTime = thumbnailPos;
+            try { videoEl.currentTime = thumbnailPos; } catch (e) {}
         });
     }
 
@@ -2822,7 +3942,7 @@ function createAssetCard(asset) {
 
         favBtn.addEventListener('click', function (e) {
             e.stopPropagation();
-            let favorites = JSON.parse(localStorage.getItem('vt_favorites') || '[]');
+            let favorites = readStoredList('vt_favorites');
 
             if (favorites.includes(asset.id)) {
                 favorites = favorites.filter(id => id !== asset.id);
@@ -2856,7 +3976,7 @@ function createAssetCard(asset) {
         const ghostIcon = ghost.querySelector('.drag-ghost-icon');
         if (ghost && ghostIcon) {
             // Copy icon from card
-            ghostIcon.innerHTML = isMogrt ? '📊' : (isAudio ? '🎵' : getAssetIcon(asset.type));
+            ghostIcon.innerHTML = isMogrt ? '📊' : (isAudio ? '🎵' : (isImage ? '🖼️' : getAssetIcon(asset.type)));
             // Better: clone the actual icon element from the card to keep styles
             const cardIcon = card.querySelector('.asset-icon svg, .asset-icon');
             if (cardIcon) {
@@ -2878,20 +3998,15 @@ function createAssetCard(asset) {
 
         let dragPath;
 
-        // MOGRT files need placeholder system for position detection
-        // (importMGT API requires time parameter)
+        // MOGRT: native drag of the real .mogrt file - Premiere places it at
+        // the drop position exactly like an Explorer drag (AtomX-style).
+        // No .vtbk placeholder is created, so no _vt_trash bin appears.
         if (isMogrtFile(asset.path)) {
-            dragPath = createVtbkFile(asset);
-            if (!dragPath) {
-                addLog('ERROR: Failed to create .vtbk file for MOGRT', 'error');
-                e.preventDefault();
-                return;
-            }
-
-            // Store for placeholder replacement with MOGRT
-            window._vtDraggedAsset = asset;
-            addLog('MOGRT drag with placeholder: ' + dragPath, 'info');
-            setStatus('Drop MOGRT on timeline...');
+            dragPath = asset.path;
+            window._vtDraggedAsset = null;
+            window._vtVideoDragSpeed = 1.0;
+            addLog('Native MOGRT drag: ' + dragPath, 'info');
+            setStatus('Drop "' + asset.name + '" on timeline...');
         }
         // External files (video/audio but NOT mogrt)
         else if (asset.isExternal) {
@@ -2911,6 +4026,11 @@ function createAssetCard(asset) {
                 dragPath = asset.path;
                 addLog('Native drag for external file: ' + dragPath, 'info');
                 window._vtDraggedAsset = null;
+                if (isVideoFile(asset.path)) {
+                    window._vtVideoDragSpeed = (typeof VideoPreview !== 'undefined' && VideoPreview) ? (parseFloat(VideoPreview.speed) || 1.0) : 1.0;
+                } else {
+                    window._vtVideoDragSpeed = null;
+                }
                 setStatus('Drop "' + asset.name + '" on timeline...');
             }
         } else {
@@ -2926,6 +4046,24 @@ function createAssetCard(asset) {
             window._vtDraggedAsset = asset;
             addLog('Drag started with .vtbk: ' + dragPath, 'info');
             setStatus('Drop on timeline where you want the asset...');
+        }
+
+        // Open the undo group BEFORE the user drops: the native placeholder
+        // drop is itself an Overwrite history entry, so it must sit inside
+        // the collapsed group - otherwise one Overwrite survives every Ctrl+Z.
+        // Native video drops snapshot the timeline first so dragend can find
+        // the new clip and apply the preview speed inside this group.
+        // Remember where the playhead is BEFORE the drop (every drag type), so
+        // the insert can put it back exactly there; a fresh capture also
+        // replaces any stale one from an earlier drag.
+        evalScriptAsync('VT_capturePlayhead()');
+        // v3.9.11: no warm-up at drag start - it put greyed "Create VT_undo_..."
+        // and "Rename item to ..." lines in the History panel while dragging.
+        if (window._vtDraggedAsset) {
+            beginUndoGroup(true, true);
+        } else if (window._vtVideoDragSpeed != null) {
+            evalScriptAsync('VT_markTimelineSnapshot()');
+            beginUndoGroup(true, true);
         }
 
         // Use CEP native file drag
@@ -2944,6 +4082,10 @@ function createAssetCard(asset) {
             addLog('Drag ended, checking for placeholder...', 'info');
             startPlaceholderPolling(window._vtDraggedAsset);
             window._vtDraggedAsset = null;
+        } else if (window._vtVideoDragSpeed != null) {
+            const speed = window._vtVideoDragSpeed;
+            window._vtVideoDragSpeed = null;
+            startNativeVideoSpeedPolling(speed, isMogrt ? asset : null);
         }
     });
 
@@ -2963,34 +4105,105 @@ function startPlaceholderPolling(asset) {
     let attempts = 0;
     const maxAttempts = 40;
     let isProcessing = false;
+    let timedOut = false;
     let pollInterval = null;
 
+    let findInFlight = false;
     pollInterval = setInterval(async function () {
-        if (isProcessing || isVtBusy()) return;
+        // v3.9.12: one lookup at a time - the 25 ms timer used to fire new
+        // VT_findPlaceholder calls while the previous ones were still running
+        // (3 identical "Found .vtbk" lines per drop in the log)
+        if (isProcessing || timedOut || findInFlight || isVtBusy()) return;
 
         attempts++;
 
         // Check if placeholder is on timeline
-        const result = await evalScriptAsync('VT_findPlaceholder()');
+        findInFlight = true;
+        let result;
+        try { result = await evalScriptAsync('VT_findPlaceholder()'); } finally { findInFlight = false; }
 
         if (result && result !== 'null' && result !== 'false') {
             // IMMEDIATELY set lock and clear interval BEFORE any async work
-            if (isProcessing) return; // Double-check in case of race
+            if (isProcessing || timedOut) return; // Double-check in case of race
             isProcessing = true;
             clearInterval(pollInterval);
             pollInterval = null;
 
             addLog('Found placeholder at: ' + result, 'info');
 
+            // The drop just landed on the timeline - OS focus should be on it.
+            // Remember the HWND so focusfix can restore it before future
+            // DLL copy/paste operations.
+            rememberTimelineFocus();
+
             // Replace placeholder with asset (now safe from duplicates)
             await replacePlaceholderWithAsset(asset, result);
-        } else if (attempts >= maxAttempts) {
+        } else if (attempts >= maxAttempts && !timedOut) {
+            // Set flag FIRST so other in-flight async callbacks skip the block.
+            // evalScriptAsync is async: many callbacks can be awaiting simultaneously,
+            // and without this flag all of them would enter here and log duplicates.
+            timedOut = true;
             clearInterval(pollInterval);
             pollInterval = null;
             addLog('No placeholder found - drag may have been cancelled', 'info');
+            await evalScriptAsync('VT_cancelUndoGroup()');
             setStatus('Ready');
         }
     }, 25);
+}
+
+/**
+ * After a native video drop, poll for the new clip and apply the preview
+ * bar's speed to it inside the undo group opened at dragstart. On timeout
+ * (drop cancelled / not on timeline) the group is cancelled instead.
+ * @param {number} speed - Preview speed (1.0 wraps the drop only)
+ */
+function startNativeVideoSpeedPolling(speed, dropAsset) {
+    let attempts = 0;
+    const maxAttempts = 30;
+    let isProcessing = false;
+    let pollInterval = null;
+
+    pollInterval = setInterval(async function () {
+        if (isProcessing || isVtBusy()) return;
+        attempts++;
+
+        // Let the native drop settle first - polling during the drop makes
+        // Premiere and ExtendScript fight over the UI thread
+        if (attempts <= 2) return;
+
+        isProcessing = true;
+        try {
+            const result = await evalScriptAsync('VT_applySpeedToNewClips(' + JSON.stringify(speed) + ')');
+            const parsed = JSON.parse(result);
+            if (parsed && parsed.success && parsed.found) {
+                clearInterval(pollInterval);
+                pollInterval = null;
+                if (speed !== 1.0) {
+                    addLog('Video speed ' + speed + 'x applied to ' + parsed.count + ' clip(s)', 'info');
+                }
+                if (dropAsset) {
+                    addToRecent(dropAsset.id);
+                    setStatus('Applied: ' + dropAsset.name);
+                    addLog('MOGRT inserted at drop position (' + parsed.count + ' new clip(s))', 'info');
+                }
+                await endUndoGroup();
+            } else if (attempts >= maxAttempts) {
+                clearInterval(pollInterval);
+                pollInterval = null;
+                addLog(dropAsset ? 'MOGRT drop not detected - native .mogrt drop may be unsupported' : 'No new video clip detected - speed not applied', 'info');
+                await evalScriptAsync('VT_cancelUndoGroup()');
+            }
+        } catch (e) {
+            if (attempts >= maxAttempts) {
+                clearInterval(pollInterval);
+                pollInterval = null;
+                addLog('Video speed poll failed: ' + e, 'warning');
+                await evalScriptAsync('VT_cancelUndoGroup()');
+            }
+        }
+        isProcessing = false;
+    }, 150);
 }
 
 /**
@@ -3038,11 +4251,12 @@ async function replacePlaceholderWithAsset(asset, placeholderInfo) {
             .replace(/\\/g, '\\\\')
             .replace(/'/g, "\\'");
 
-        // Build drag options from AudioPreview (pitch/speed/reverse)
+        // Build drag options from AudioPreview (speed/reverse; pitch and speed
+        // for audio are baked into the FFmpeg render)
         let dragSpeed = 1.0;
         let dragReverse = false;
         if (typeof AudioPreview !== 'undefined' && AudioPreview && AudioPreview.asset && AudioPreview.asset.id === asset.id) {
-            dragSpeed = parseFloat(AudioPreview.pitch) || 1.0;
+            dragSpeed = parseFloat(AudioPreview.speed) || 1.0;
             dragReverse = AudioPreview.reverseCheck ? AudioPreview.reverseCheck.checked : false;
         }
         const dragOptionsStr = JSON.stringify({ speed: dragSpeed, reverse: dragReverse });
@@ -3058,8 +4272,14 @@ async function replacePlaceholderWithAsset(asset, placeholderInfo) {
 
             try {
                 setVtBusy(true);
-                const ddScript = `VT_dragDropSingleCall("${escapedPath}", (${safeplaceholderInfo}), "${asset.type}")`;
-                const ddResult = await evalScriptAsync(ddScript);
+                await beginUndoGroup();
+                // MOGRT assets: native insert at the drop position first
+                let ddResult = await tryNativeMogrtInsert(asset, escapedPath, safeplaceholderInfo);
+                if (ddResult === null) {
+                    // Prime (2-step copy) + focus + verified paste with retries
+                    ddResult = await insertWithRetries(escapedPath, (fastOnly) =>
+                        evalScriptAsync(`VT_dragDropSingleCall("${escapedPath}", (${safeplaceholderInfo}), "${asset.type}", ${fastOnly ? 'true' : 'false'})`));
+                }
                 setVtBusy(false);
 
                 addLog('Result: ' + ddResult);
@@ -3069,6 +4289,7 @@ async function replacePlaceholderWithAsset(asset, placeholderInfo) {
                     addToRecent(asset.id);
                     setStatus('Applied: ' + asset.name);
                     addLog('=== SUCCESS! === (' + (ddData.clipsCount || '?') + ' clips)');
+                    await endUndoGroup();
                 } else {
                     throw new Error('Drag-drop failed: ' + (ddData.error || 'unknown'));
                 }
@@ -3081,7 +4302,7 @@ async function replacePlaceholderWithAsset(asset, placeholderInfo) {
                 addLog('Single-call drag-drop error: ' + stepErr.message, 'error');
                 addLog('Trying fallback applyAsset...', 'info');
                 try {
-                    await applyAsset(asset);
+                    await applyAsset(asset, true);
                     addLog('=== SUCCESS via fallback! ===');
                     return;
                 } catch (fallbackErr) {
@@ -3093,12 +4314,15 @@ async function replacePlaceholderWithAsset(asset, placeholderInfo) {
         // MOGRT and external file paths (single-call, no DLL copy/paste needed)
         if (script) {
             addLog('Executing single-call: ' + script.substring(0, 200) + '...');
+            await beginUndoGroup();
             let result = await evalScriptAsync(script);
             addLog('Result: ' + result);
 
-            try {
-                const parsed = JSON.parse(result);
-                if (parsed.success) {
+            let insertParsed = null;
+            try { insertParsed = JSON.parse(result); } catch (jsonErr) { /* not JSON */ }
+
+            if (insertParsed) {
+                if (insertParsed.success) {
                     addToRecent(asset.id);
                     setStatus('Applied: ' + asset.name);
                     addLog('=== SUCCESS! ===');
@@ -3106,17 +4330,20 @@ async function replacePlaceholderWithAsset(asset, placeholderInfo) {
                     // panel - VT_insertExternalFile (audio/MOGRT) doesn't clean the bin
                     // like the .prproj path (VT_dragDropSingleCall) does.
                     try { await evalScriptAsync('VT_cleanupPlaceholdersFromBin()'); } catch (e) { addLog('Placeholder bin cleanup failed, vt_drag_ items left in Project panel: ' + e, 'error'); }
+                    await endUndoGroup();
                 } else {
-                    addLog('Error in result: ' + (parsed.error || 'unknown'));
-                    setStatus('Error: ' + (parsed.error || 'Failed'));
+                    addLog('Error in result: ' + (insertParsed.error || 'unknown'));
+                    await evalScriptAsync('VT_cancelUndoGroup()');
+                    setStatus('Error: ' + (insertParsed.error || 'Failed'));
                 }
-            } catch (pe) {
-                if (result && result.indexOf('success') !== -1) {
-                    addToRecent(asset.id);
-                    setStatus('Applied: ' + asset.name);
-                } else {
-                    addLog('Bad result: ' + result);
-                }
+            } else if (result === 'true') {
+                // Legacy boolean success
+                addToRecent(asset.id);
+                setStatus('Applied: ' + asset.name);
+                await endUndoGroup();
+            } else {
+                addLog('Bad result: ' + result);
+                await evalScriptAsync('VT_cancelUndoGroup()');
             }
         }
 
@@ -3124,6 +4351,9 @@ async function replacePlaceholderWithAsset(asset, placeholderInfo) {
 
     } catch (error) {
         addLog('ERROR: ' + error.message, 'error');
+        // Failed insert must not leave the placeholder clip or its project item
+        // behind - clean both up (AtomX-style: zero leftovers).
+        try { await evalScriptAsync('VT_cleanupStrayPlaceholders()'); } catch (clnErr) { addLog('Stray placeholder cleanup failed: ' + clnErr, 'warning'); }
         // Try to read debug log
         try {
             const debugLog = await evalScriptAsync('VT_readDebugLog()');
@@ -3183,11 +4413,11 @@ async function ensureHostScript() {
  * Apply asset to timeline at playhead position
  * Uses Copy/Paste via keyboard simulation
  */
-async function applyAsset(asset) {
+async function applyAsset(asset, keepPendingGroup) {
     setStatus('Applying "' + asset.name + '"...');
     addLog('=== Starting Apply Asset ===', 'info');
     addLog('Asset: ' + asset.name);
-    addLog('Path: ' + asset.path);
+    addLog('Path: ' + (asset.path || '(effect JSON)'));
 
     // Build apply options
     let applySpeed = 1.0;
@@ -3195,7 +4425,7 @@ async function applyAsset(asset) {
     let srcPath = asset.path;
 
     if (typeof AudioPreview !== 'undefined' && AudioPreview && AudioPreview.asset && AudioPreview.asset.id === asset.id) {
-        applySpeed = parseFloat(AudioPreview.pitch) || 1.0;
+        applySpeed = parseFloat(AudioPreview.speed) || 1.0;
         applyReverse = AudioPreview.reverseCheck ? AudioPreview.reverseCheck.checked : false;
         
         if (AudioPreview.isProcessing && AudioPreview.processingPromise) {
@@ -3212,7 +4442,12 @@ async function applyAsset(asset) {
         }
     }
 
-    const escapedPath = srcPath.replace(/\\/g, '\\\\');
+    if (typeof VideoPreview !== 'undefined' && VideoPreview && VideoPreview.asset && VideoPreview.asset.id === asset.id) {
+        applySpeed = parseFloat(VideoPreview.speed) || 1.0;
+        applyReverse = VideoPreview.isReversed ? VideoPreview.isReversed() : false;
+    }
+
+    const escapedPath = srcPath ? srcPath.replace(/\\/g, '\\\\') : '';
 
     try {
         const optionsStr = JSON.stringify({
@@ -3227,37 +4462,66 @@ async function applyAsset(asset) {
 
         let result;
 
+        // v3.9.12: always a fresh group. A failed insert used to leave its
+        // start index pending, the next double-click reused it, and Ctrl+Z then
+        // also took back everything the user did in between.
+        // (keepPendingGroup: fallback from a drag - keep the group opened at
+        // drag start so the placeholder drop stays inside it)
+        await beginUndoGroup(!keepPendingGroup);
+
         // MOGRT files use sequence.importMGT API
         if (isMogrtFile(asset.path)) {
             addLog('Applying MOGRT with importMGT...');
             result = await evalScriptAsync(`VT_insertMogrt("${escapedPath}")`);
             addLog('Result: ' + result);
         } else if (asset.isExternal) {
-            addLog('Applying external file (' + (isAudioFile(asset.path) ? 'audio' : 'video') + ') with pitch=' + applySpeed + ' reverse=' + applyReverse);
+            addLog('Applying external file (' + (isAudioFile(asset.path) ? 'audio' : 'video') + ') with speed=' + applySpeed + ' reverse=' + applyReverse);
             const applyOptionsJson = JSON.stringify({ speed: applySpeed, reverse: applyReverse });
             result = await evalScriptAsync(`VT_insertExternalFile("${escapedPath}", null, ${applyOptionsJson})`);
             addLog('Result: ' + result);
         } else {
             // Use native DLL - single call does everything!
             addLog('Applying with native DLL (SAFE)...');
+
+            // The DLL copy/paste is a synthetic Ctrl+C/V that goes to the
+            // OS-focused window, so insertWithRetries primes the clipboard in
+            // two host calls and moves focus to the timeline (VT_WMCommand
+            // focusfix) before every paste; every paste is verified.
             // Use _Safe version to bypass bytecode cache
-            result = await evalScriptAsync(`VT_applyAssetNative_Safe("${escapedPath}", ${JSON.stringify(optionsStr)})`);
+            // MOGRT assets: native insert first (no clipboard, nothing opened)
+            result = (applySpeed === 1 && !applyReverse) ? await tryNativeMogrtInsert(asset, escapedPath, null) : null;
+            if (result === null) {
+                result = await insertWithRetries(escapedPath, (fastOnly) =>
+                    evalScriptAsync(`VT_applyAssetNative_Safe("${escapedPath}", ${JSON.stringify(optionsStr)}, ${fastOnly ? 'true' : 'false'})`));
+            }
             addLog('Result: ' + result);
         }
 
+        await endUndoGroup();
+
         // Try to parse as JSON
-        try {
-            const parsed = JSON.parse(result);
-            if (parsed.success) {
-                addLog('Copy: ' + parsed.copyResult + ', Paste: ' + parsed.pasteResult + ', Clips: ' + parsed.clipsCount);
+        let applyParsed = null;
+        try { applyParsed = JSON.parse(result); } catch (jsonErr) { /* not JSON */ }
+
+        if (applyParsed) {
+            if (applyParsed.success) {
+                addLog('Copy: ' + applyParsed.copyResult + ', Paste: ' + applyParsed.pasteResult + ', Clips: ' + applyParsed.clipsCount);
                 setStatus('Applied: ' + asset.name);
                 addLog('=== SUCCESS! ===');
+                // Real DLL paste success = timeline had focus during the
+                // operation. Remember its HWND for future focusfix restores.
+                // Nested DOM-fallback success does not prove timeline focus.
+                // Only a real clipboard paste proves the timeline had focus.
+                // (Remembering after a DOM insert - e.g. an imported .jpg -
+                // stored another window, and the next paste went there.)
+                if (!applyParsed.nested && applyParsed.pasteResult === true) rememberTimelineFocus();
             } else {
-                throw new Error(result);
+                // Host returned structured failure - show the real error message
+                throw new Error(applyParsed.error || ('Apply failed: ' + result));
             }
-        } catch (parseErr) {
-            // Not JSON, check for 'true' or error
-            if (result && result.indexOf('success') !== -1) {
+        } else {
+            // Not JSON - legacy true/false or error string
+            if (result === 'true') {
                 setStatus('Applied: ' + asset.name);
                 addLog('=== SUCCESS! ===');
             } else {
@@ -3271,8 +4535,126 @@ async function applyAsset(asset) {
         addLog('ERROR: ' + error.message, 'error');
         setStatus('Error: ' + error.message);
         setTimeout(() => setStatus('Ready'), 3000);
+        try { await evalScriptAsync('VT_cancelUndoGroup()'); } catch (e) { /* ignore */ }
         throw error; // Re-throw so callers know it failed
     }
+}
+
+/**
+ * Put a saved (.prproj) asset's clips on the clipboard (v3.9.2, two steps).
+ * Step 1 (host) opens the asset sequence with its clips selected; the panel
+ * then moves OS focus to the timeline window; step 2 (host) copies and goes
+ * back to the user's sequence. Copying in the same host call as the switch
+ * often hit the USER's timeline and copied its selected clip - the cause of
+ * "double-click inserts a copy of the previous media".
+ * Never throws; returns the parsed host result or null.
+ * @param {string} escapedAssetPath - asset path with backslashes already doubled
+ * @param {boolean} [force] - ignore the existing clipboard cache
+ */
+async function primeAssetClipboard(escapedAssetPath, force) {
+    if (!/\.prproj$/i.test(escapedAssetPath || '')) return null; // only saved timeline assets
+    try {
+        const d1 = JSON.parse(await evalScriptAsync(`VT_primeOpen("${escapedAssetPath}", ${force ? 'true' : 'false'})`));
+        if (!d1.success) {
+            addLog('Clipboard prime failed: ' + (d1.error || '?') + ' - full insert path will be used', 'warning');
+            return d1;
+        }
+        if (d1.cached) {
+            addLog('Clipboard already primed (' + d1.clips + ' clip(s))', 'info');
+            return d1;
+        }
+        runFocusFix(); // focus the timeline window that now shows the asset sequence
+        const d2 = JSON.parse(await evalScriptAsync(`VT_primeCopy("${escapedAssetPath}")`));
+        addLog('Clipboard ' + (d2.success ? 'primed' : 'prime FAILED') + ' (' + d2.clips + ' clip(s))', d2.success ? 'info' : 'warning');
+        return d2;
+    } catch (e) {
+        addLog('Clipboard prime error: ' + e, 'warning');
+        return null;
+    }
+}
+
+/**
+ * Store one field in an asset's metadata (memory + <ASSETS_DIR>/<id>.json).
+ */
+function persistAssetField(asset, key, value) {
+    asset[key] = value;
+    try {
+        const metaPath = path.join(ASSETS_DIR, asset.id + '.json');
+        const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+        meta[key] = value;
+        fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+    } catch (e) {
+        addLog('Could not update asset metadata (' + key + '): ' + e, 'warning');
+    }
+}
+
+/**
+ * NATIVE MOGRT INSERT (v3.9.3): a fresh instance of the saved template is put
+ * straight onto the track and the saved values are applied - no clipboard,
+ * no VT_Asset sequence opened, no playhead move, never a nested sequence.
+ * Older MOGRT assets are described on first use and upgraded in place.
+ * Returns the raw host result when it handled the insert, or null when the
+ * classic (clipboard) path has to be used (not a MOGRT, keyframes, ...).
+ * @param {object} asset
+ * @param {string} escapedPath - asset path with backslashes doubled
+ * @param {string|null} placeholderExpr - drop position object literal, or null = playhead
+ */
+async function tryNativeMogrtInsert(asset, escapedPath, placeholderExpr) {
+    if (!asset || !/\.prproj$/i.test(asset.path || '') || asset.mogrtNative === false) return null;
+    const metaArg = asset.mogrtNative ? JSON.stringify(JSON.stringify(asset.mogrtNative)) : '""';
+    const phArg = placeholderExpr ? '(' + placeholderExpr + ')' : 'null';
+    let d = null;
+    let raw = null;
+    try {
+        raw = await evalScriptAsync(`VT_insertMogrtAsset("${escapedPath}", ${metaArg}, ${phArg})`);
+        d = JSON.parse(raw);
+    } catch (e) {
+        return null; // host older than 3.9.3
+    }
+    if (d.meta && !asset.mogrtNative) {
+        persistAssetField(asset, 'mogrtNative', d.meta);
+        addLog('Asset upgraded to native MOGRT insert', 'info');
+    }
+    if (d.success) {
+        addLog('Inserted natively (' + d.clipsCount + ' clip(s), no clipboard, no sequence switch)', 'success');
+        return raw;
+    }
+    if (d.fallback) {
+        if (d.reason === 'not-mogrt' || d.reason === 'keyframes') persistAssetField(asset, 'mogrtNative', false);
+        addLog('Native MOGRT insert not used (' + (d.reason || '?') + ') - classic path', 'info');
+        return null;
+    }
+    return raw; // hard error (e.g. no active sequence) - report it
+}
+
+/**
+ * Insert a saved asset through the clipboard fast path, fixing focus or
+ * re-priming between attempts (v3.9.2). Every paste is VERIFIED on the host
+ * (clip names, durations, parameter values) and wrong content is removed,
+ * so a stale clipboard can no longer insert other media.
+ * After 3 fast attempts the full host path runs (verified paste, then the
+ * nested-sequence fallback with the correct content).
+ * @param {string} escapedPath - asset path with backslashes doubled
+ * @param {function(boolean): Promise<string>} callHost - runs the host insert (fastOnly)
+ * @returns {Promise<string>} raw host result
+ */
+async function insertWithRetries(escapedPath, callHost) {
+    let force = false;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        await primeAssetClipboard(escapedPath, force);
+        runFocusFix();
+        const raw = await callHost(true);
+        let d = null;
+        try { d = JSON.parse(raw); } catch (e) { /* legacy string result */ }
+        if (!d || d.success || !d.retry) return raw;
+        // 'reprime' = clipboard held other content. A second 'focus' miss can
+        // also mean the copy itself missed (empty clipboard) - re-copy then too.
+        force = d.retry === 'reprime' || attempt >= 2;
+        addLog('Insert attempt ' + attempt + ': ' + (d.error || d.retry) + ' - ' + (force ? 're-copying asset' : 'refocusing timeline'), 'warning');
+    }
+    addLog('Fast insert failed 3x - full insert path', 'warning');
+    runFocusFix();
+    return await callHost(false);
 }
 
 /**
@@ -3285,6 +4667,35 @@ function evalScriptAsync(script) {
         });
     });
 }
+
+/**
+ * Undo group helpers - wrap multi-step insert ops so one Ctrl+Z collapses them.
+ * Collapse itself is event-driven via app.addEventListener('onProjectChanged') in hostscript.
+ */
+async function beginUndoGroup(force, noWarmup) {
+    try {
+        const r = await evalScriptAsync('VT_beginUndoGroup(' + (force ? 'true' : 'false') + ', ' + (noWarmup ? 'true' : 'false') + ')');
+        const d = JSON.parse(r);
+        if (!d.success) addLog('Undo group begin: ' + (d.error || 'failed'), 'warning');
+    } catch (e) { /* non-fatal */ }
+}
+async function endUndoGroup() {
+    try {
+        const r = await evalScriptAsync('VT_endUndoGroup()');
+        const d = JSON.parse(r);
+        if (d.success) addLog('Undo group recorded [' + d.group.startIndex + '..' + d.group.endIndex + ']', 'info');
+        else addLog('Undo group end: ' + (d.error || 'failed'), 'warning');
+    } catch (e) { /* non-fatal */ }
+}
+async function registerUndoEventListener() {
+    try {
+        const r = await evalScriptAsync('VT_registerUndoEventListener()');
+        addLog('Undo event listener: ' + r, 'info');
+    } catch (e) { /* non-fatal */ }
+}
+
+
+
 
 /**
  * Show delete confirmation dialog
@@ -3327,41 +4738,181 @@ function showDeleteDialog(assetName) {
 }
 
 /**
- * Delete an asset
+ * Delete an asset (v3.9.6: straight away, no confirmation)
  */
 async function deleteAsset(asset) {
-    const confirmed = await showDeleteDialog(asset.name);
-    if (!confirmed) {
-        return;
+    if (!asset) return;
+    await deleteAssetsNow([asset.id]);
+}
+
+const PENDING_DELETES_KEY = 'vt_pending_deletes';
+const sleepMs = (ms) => new Promise(function (r) { setTimeout(r, ms); });
+
+/**
+ * The card's <video>/<audio>/<img> keep the media file open, and Windows
+ * refuses to delete an open file (EBUSY/EPERM). That made deleting fail
+ * half-way: the .json and .prproj went, the preview .mp4 stayed locked, the
+ * error was swallowed and the card stayed on screen - "nothing happens".
+ * Let go of every handle on the asset's files before deleting them.
+ */
+function releaseAssetMedia(asset, files) {
+    const cards = [];
+    const cached = _cardCache.get(asset.id);
+    if (cached) cards.push(cached);
+    document.querySelectorAll('.asset-card').forEach(function (c) {
+        if (c.dataset.assetId === asset.id && cards.indexOf(c) === -1) cards.push(c);
+    });
+    const names = files.filter(Boolean).map(function (f) { return path.basename(f).toLowerCase(); });
+    const usesFile = function (el) {
+        const src = decodeURIComponent(String(el.currentSrc || el.getAttribute('src') || el.getAttribute('data-lazy-src') || '')).toLowerCase();
+        return names.some(function (n) { return n && src.indexOf(n) !== -1; });
+    };
+    const unload = function (el) {
+        try { if (typeof el.pause === 'function') el.pause(); } catch (e) { /* ignore */ }
+        el.removeAttribute('data-lazy-src');
+        el.removeAttribute('src');
+        try { if (typeof el.load === 'function') el.load(); } catch (e) { /* ignore */ }
+    };
+    cards.forEach(function (c) {
+        try { _lazyCardObserver.unobserve(c); } catch (e) { /* ignore */ }
+        c.querySelectorAll('video, audio, img, source').forEach(unload);
+    });
+    // Players outside the card (preview bars) that may still hold the file
+    document.querySelectorAll('video, audio').forEach(function (el) { if (usesFile(el)) unload(el); });
+    try { if (AudioPreview && AudioPreview.hide) AudioPreview.hide(); } catch (e) { /* ignore */ }
+    try { if (VideoPreview && VideoPreview.hide) VideoPreview.hide(); } catch (e) { /* ignore */ }
+}
+
+/** unlink, retrying while Windows still reports the file as in use. */
+async function unlinkWithRetry(file) {
+    for (let i = 0; i < 8; i++) {
+        try {
+            if (!fs.existsSync(file)) return true;
+            fs.unlinkSync(file);
+            return true;
+        } catch (e) {
+            const code = (e && e.code) || '';
+            if (code !== 'EBUSY' && code !== 'EPERM' && code !== 'EACCES') {
+                addLog('Delete: could not remove ' + file + ': ' + e, 'error');
+                return false;
+            }
+            await sleepMs(120 * (i + 1));
+        }
     }
+    return false;
+}
 
+function readPendingDeletes() {
+    try { const v = JSON.parse(localStorage.getItem(PENDING_DELETES_KEY) || '[]'); return Array.isArray(v) ? v : []; } catch (e) { return []; }
+}
+function writePendingDeletes(list) {
     try {
-        // Delete files
-        const prprojPath = asset.path;
-        const metaPath = path.join(ASSETS_DIR, asset.id + '.json');
-        const previewPath = getPreviewPath(asset.path);
+        if (list.length) localStorage.setItem(PENDING_DELETES_KEY, JSON.stringify(list));
+        else localStorage.removeItem(PENDING_DELETES_KEY);
+    } catch (e) { /* storage unavailable */ }
+}
 
-        if (fs.existsSync(prprojPath)) {
-            fs.unlinkSync(prprojPath);
-        }
-        if (fs.existsSync(metaPath)) {
-            fs.unlinkSync(metaPath);
-        }
-        if (fs.existsSync(previewPath)) {
-            fs.unlinkSync(previewPath);
-        }
+/** Files that were still locked last time are removed on the next start. */
+function retryPendingDeletes() {
+    const left = [];
+    readPendingDeletes().forEach(function (f) {
+        try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch (e) { left.push(f); }
+    });
+    writePendingDeletes(left);
+}
 
-        // Remove from array
-        assets = assets.filter(a => a.id !== asset.id);
-
-        invalidateCardCache(asset.id);
-        renderAssets();
-        setStatus('Asset deleted');
-        addLog(`Deleted asset: ${asset.name}`);
+/**
+ * Files in the assets folder that no asset refers to any more - leftovers of
+ * deletes that failed before v3.9.6 (mostly 10 MB preview videos). Only
+ * plugin-named files ("asset_<digits>.<ext>") older than 10 minutes, so a save
+ * that is still writing its files is never touched.
+ */
+function sweepOrphanAssetFiles() {
+    try {
+        if (!fs.existsSync(ASSETS_DIR)) return;
+        const files = fs.readdirSync(ASSETS_DIR);
+        const ids = new Set();
+        const referenced = new Set();
+        files.forEach(function (f) {
+            if (!/\.json$/i.test(f)) return;
+            ids.add(f.replace(/\.json$/i, '').toLowerCase());
+            try {
+                const meta = JSON.parse(fs.readFileSync(path.join(ASSETS_DIR, f), 'utf8'));
+                if (meta.path) {
+                    referenced.add(path.basename(meta.path).toLowerCase());
+                    referenced.add(path.basename(getPreviewPath(meta.path)).toLowerCase());
+                }
+            } catch (e) { ids.add('__unreadable__'); }
+        });
+        if (ids.has('__unreadable__')) return; // never guess when a metadata file is damaged
+        const tooNew = Date.now() - 10 * 60 * 1000;
+        let removed = 0;
+        files.forEach(function (f) {
+            const m = /^(asset_\d+(?:_\d+)?)\.(mp4|mov|prproj|mp3|wav|aac|m4a|jpg|jpeg|png|gif|webp)$/i.exec(f);
+            if (!m) return;
+            if (ids.has(m[1].toLowerCase()) || referenced.has(f.toLowerCase())) return;
+            const full = path.join(ASSETS_DIR, f);
+            try {
+                const st = fs.statSync(full);
+                if (!st.isFile() || st.mtimeMs > tooNew) return;
+                fs.unlinkSync(full);
+                removed++;
+            } catch (e) { /* locked or gone - try again next start */ }
+        });
+        if (removed) addLog('Removed ' + removed + ' leftover file(s) of deleted assets', 'info');
     } catch (e) {
-        console.error('Error deleting asset:', e);
-        setStatus('Error deleting asset');
-        addLog('Error deleting asset: ' + e, 'error');
+        addLog('Leftover sweep failed: ' + e, 'warning');
+    }
+}
+
+/**
+ * Delete assets immediately: the asset disappears from the panel at once,
+ * its metadata goes first, then its media files (with retries while the file
+ * is still being released). A file that stays locked is removed on the next
+ * panel start instead of blocking the delete.
+ */
+async function deleteAssetsNow(ids) {
+    const list = (ids || []).map(function (id) { return assets.find(function (a) { return a.id === id; }); }).filter(Boolean);
+    if (!list.length) return;
+
+    const jobs = [];
+    list.forEach(function (asset) {
+        const files = [];
+        if (asset.path) {
+            files.push(asset.path);
+            const pv = getPreviewPath(asset.path);
+            if (pv && pv !== asset.path) files.push(pv);
+        }
+        releaseAssetMedia(asset, files);
+        const metaPath = path.join(ASSETS_DIR, asset.id + '.json');
+        try {
+            if (fs.existsSync(metaPath)) fs.unlinkSync(metaPath);
+        } catch (e) {
+            addLog('Delete: could not remove ' + metaPath + ': ' + e, 'error');
+        }
+        jobs.push({ asset: asset, files: files });
+    });
+
+    // Gone from the panel right away
+    const gone = new Set(list.map(function (a) { return a.id; }));
+    assets = assets.filter(function (a) { return !gone.has(a.id); });
+    gone.forEach(function (id) { invalidateCardCache(id); selectedAssetIds.delete(id); });
+    renderAssets();
+    setStatus(list.length === 1 ? 'Asset deleted' : ('Deleted ' + list.length + ' assets'));
+    addLog(list.length === 1 ? ('Deleted asset: ' + list[0].name) : ('Deleted ' + list.length + ' assets'));
+
+    // Media files: let the player release them, then remove
+    await sleepMs(60);
+    const stuck = [];
+    for (const job of jobs) {
+        for (const f of job.files) {
+            const ok = await unlinkWithRetry(f);
+            if (!ok && fs.existsSync(f)) stuck.push(f);
+        }
+    }
+    if (stuck.length) {
+        writePendingDeletes(readPendingDeletes().concat(stuck));
+        addLog('Still in use, will be removed on next start: ' + stuck.map(function (f) { return path.basename(f); }).join(', '), 'warning');
     }
 }
 
@@ -3373,6 +4924,29 @@ function setStatus(text) {
         statusText.textContent = text;
     }
 }
+
+// Allow mouse wheel to adjust any range slider when hovering over it.
+// Delegated on document so it covers every input[type=range] (volume,
+// speed, pitch, zoom, settings sliders, and any future ones) without
+// per-slider wiring. passive:false is required for preventDefault.
+document.addEventListener('wheel', function (e) {
+    const slider = e.target;
+    if (!slider || slider.tagName !== 'INPUT' || slider.type !== 'range') return;
+    e.preventDefault();
+    const step = parseFloat(slider.step) || 1;
+    const min = parseFloat(slider.min) || 0;
+    const max = parseFloat(slider.max) || 100;
+    const dir = e.deltaY < 0 ? 1 : -1;
+    let val = parseFloat(slider.value) + dir * step;
+    val = Math.min(max, Math.max(min, val));
+    // Round to step precision to avoid floating-point drift (0.30000000000000004)
+    const decimals = (String(step).split('.')[1] || '').length;
+    val = parseFloat(val.toFixed(decimals));
+    slider.value = val;
+    // Fire input (live update) + change (persist) so existing listeners respond
+    slider.dispatchEvent(new Event('input', { bubbles: true }));
+    slider.dispatchEvent(new Event('change', { bubbles: true }));
+}, { passive: false });
 
 // Initialize when DOM is ready
 if (document.readyState === 'loading') {

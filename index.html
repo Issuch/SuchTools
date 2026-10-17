@@ -5,7 +5,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>VibeTools</title>
-    <link rel="stylesheet" href="css/styles.css">
+    <link rel="stylesheet" href="css/styles.css?v=3980">
 </head>
 
 <body>
@@ -62,15 +62,6 @@
         <div class="main-content">
             <!-- Category Sidebar -->
             <aside class="sidebar" id="categorySidebar">
-                <div class="sidebar-header">
-                    <button class="sidebar-toggle" id="sidebarToggle" title="Toggle sidebar">
-                        <span class="toggle-icon">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                <polyline points="15 18 9 12 15 6"></polyline>
-                            </svg>
-                        </span>
-                    </button>
-                </div>
                 <div class="category-tile active" data-category="all">
                     <span class="tile-icon">
                         <svg viewBox="0 0 24 24">
@@ -261,6 +252,32 @@
                                     Import from File
                     </div>
                     </div>
+                        <div class="btn-dropdown" id="presetsDropdown">
+                            <button id="presetsBtn" class="btn-presets" title="Presets: save all settings of the selected clip and apply them later">
+                                <span class="btn-icon">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                                        stroke-linecap="round" stroke-linejoin="round">
+                                        <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>
+                                    </svg>
+                                </span> Presets
+                            </button>
+                            <div class="dropdown-menu presets-menu" id="presetsMenu">
+                                <div class="presets-target" id="presetTarget">Select a clip on the timeline</div>
+                                <div class="presets-save-row">
+                                    <input type="text" id="presetNameInput" placeholder="Preset name..." maxlength="60">
+
+                                    <button id="presetSaveBtn" class="btn-preset-save" title="Save all settings of the selected clip as a preset">Save</button>
+                                </div>
+                                <div class="presets-opts" id="presetOpts" title="What a preset changes when you apply it">
+                                    <span class="presets-opts-label">Apply</span>
+                                    <button type="button" class="preset-opt" data-opt="text" aria-pressed="true" title="Off: keep the clip's own words - apply only font, size and colours">Text</button>
+                                    <button type="button" class="preset-opt" data-opt="motion" aria-pressed="true" title="Position, scale, rotation, anchor, crop">Motion</button>
+                                    <button type="button" class="preset-opt" data-opt="opacity" aria-pressed="true" title="Opacity and blend mode">Opacity</button>
+                                    <button type="button" class="preset-opt" data-opt="addMissing" aria-pressed="true" title="Add effects the preset has but the clip does not have yet">+ Effects</button>
+                                </div>
+                                <div id="presetList" class="preset-list"></div>
+                            </div>
+                        </div>
                     <!-- Captions toolbar (hidden) -->
                     <div id="toolbarCaptions" style="display:none">
                     <div class="toolbar-search disabled">
@@ -362,11 +379,29 @@
                             <input type="range" id="audioPitchSlider" min="0.5" max="2.0" step="0.1" value="1.0"
                                 class="pitch-slider">
                             <span id="audioPitchValue" class="value-display">1.0x</span>
-                            <button class="reset-btn" id="audioPitchReset">Reset</button>
 
-                            <label class="checkbox-label reverse-check">
+                            <span class="setting-label">Speed:</span>
+                            <input type="range" id="audioSpeedSlider" min="0.5" max="2.0" step="0.1" value="1.0"
+                                class="pitch-slider">
+                            <span id="audioSpeedValue" class="value-display">1.0x</span>
+
+                            <label class="icon-toggle" title="Reverse">
                                 <input type="checkbox" id="audioReverseCheck">
-                                <span>Reverse</span>
+                                <span>
+                                    <svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor">
+                                        <path d="M11 5v14L2 12z" />
+                                        <path d="M22 5v14l-9-7z" />
+                                    </svg>
+                                </span>
+                            </label>
+
+                            <label class="icon-toggle" title="Keep pitch">
+                                <input type="checkbox" id="audioKeepPitch" checked>
+                                <span>
+                                    <svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor">
+                                        <path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z" />
+                                    </svg>
+                                </span>
                             </label>
                         </div>
                     </div>
@@ -375,6 +410,84 @@
                     <span id="audioPreviewName" style="display:none"></span>
                     <span id="audioTotalTime" style="display:none"></span>
                 </div>
+
+                <!-- Video Preview Bar (Inside Right Panel) -->
+                <div id="videoPreviewBar" class="audio-preview-bar video-preview-bar hidden">
+                    <button class="audio-preview-close" id="videoPreviewClose" title="Close">&times;</button>
+
+                    <!-- Row 1: Controls -->
+                    <div class="preview-row controls-row">
+                        <div class="controls-left">
+                            <button class="audio-btn play-btn" id="videoPlayBtn" title="Play/Pause">
+                                <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+                                    <path d="M8 5v14l11-7z" class="play-icon" />
+                                    <path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z" class="pause-icon" style="display:none" />
+                                </svg>
+                            </button>
+                            <button class="audio-btn secondary-btn" id="videoReplayBtn" title="Replay">
+                                <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor">
+                                    <path d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z" />
+                                </svg>
+                            </button>
+                            <div class="volume-control">
+                                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor"
+                                    stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+                                    <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+                                </svg>
+                                <input type="range" class="volume-slider" id="videoVolumeSlider" min="0" max="1"
+                                    step="0.01" value="0.8">
+                            </div>
+                        </div>
+                        <div class="audio-time-display">
+                            <span id="videoCurrentTime">00:00.00</span>
+                        </div>
+                    </div>
+
+                    <!-- Row 2: Video + Timeline -->
+                    <div class="preview-row video-row">
+                        <video id="videoPreviewElement" class="video-preview-element" playsinline
+                            preload="metadata"></video>
+                        <canvas id="videoTimelineCanvas" class="video-timeline-canvas"></canvas>
+                    </div>
+
+                    <!-- Row 3: Pitch & Reverse -->
+                    <div class="preview-row settings-row">
+                        <div class="settings-left">
+                            <span class="setting-label">Pitch:</span>
+                            <input type="range" id="videoPitchSlider" min="0.5" max="2.0" step="0.1" value="1.0"
+                                class="pitch-slider">
+                            <span id="videoPitchValue" class="value-display">1.0x</span>
+
+                            <span class="setting-label">Speed:</span>
+                            <input type="range" id="videoSpeedSlider" min="0.5" max="2.0" step="0.1" value="1.0"
+                                class="pitch-slider">
+                            <span id="videoSpeedValue" class="value-display">1.0x</span>
+
+                            <label class="icon-toggle" title="Reverse">
+                                <input type="checkbox" id="videoReverseCheck">
+                                <span>
+                                    <svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor">
+                                        <path d="M11 5v14L2 12z" />
+                                        <path d="M22 5v14l-9-7z" />
+                                    </svg>
+                                </span>
+                            </label>
+
+                            <label class="icon-toggle" title="Keep pitch">
+                                <input type="checkbox" id="videoKeepPitch" checked>
+                                <span>
+                                    <svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor">
+                                        <path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z" />
+                                    </svg>
+                                </span>
+                            </label>
+                        </div>
+                    </div>
+
+                    <!-- Hidden elements needed for logic but not displayed -->
+                    <span id="videoPreviewName" style="display:none"></span>
+                </div>
             </div>
         </div>
 
@@ -382,6 +495,7 @@
         <div class="dialog-overlay" id="saveDialog" style="display: none;">
             <div class="dialog">
                 <h2>Save Asset</h2>
+                <div id="importBatchNote" class="import-batch-note" style="display:none;"></div>
                 <input type="text" id="assetName" placeholder="Asset name..." class="input-field">
 
                 <!-- Subcategory -->
@@ -519,6 +633,62 @@
                             <span class="slider round"></span>
                         </label>
                     </div>
+                    <div class="setting-item">
+                        <label for="settingAutoPlayAudio">Auto-play audio &amp; video on click</label>
+                        <label class="switch">
+                            <input type="checkbox" id="settingAutoPlayAudio">
+                            <span class="slider round"></span>
+                        </label>
+                    </div>
+                    <div class="setting-item">
+                        <label for="settingShowCardMeta">Show type &amp; category on cards</label>
+                        <label class="switch">
+                            <input type="checkbox" id="settingShowCardMeta">
+                            <span class="slider round"></span>
+                        </label>
+                    </div>
+                    <div class="setting-item">
+                        <label for="settingShowPreviewDim">Show dim &amp; title on video previews</label>
+                        <label class="switch">
+                            <input type="checkbox" id="settingShowPreviewDim">
+                            <span class="slider round"></span>
+                        </label>
+                    </div>
+                    <div class="setting-item">
+                        <label for="settingPresetSoundDisabled">Mute preset sounds</label>
+                        <label class="switch">
+                            <input type="checkbox" id="settingPresetSoundDisabled">
+                            <span class="slider round"></span>
+                        </label>
+                    </div>
+                    <div class="setting-item">
+                        <label for="settingAssetSoundDisabled">Mute asset save sounds</label>
+                        <label class="switch">
+                            <input type="checkbox" id="settingAssetSoundDisabled">
+                            <span class="slider round"></span>
+                        </label>
+                    </div>
+                    <div class="setting-item">
+                        <label for="settingWaveformHeight">Waveform height</label>
+                        <div class="setting-slider-row">
+                            <input type="range" id="settingWaveformHeight" min="0" max="100" step="5" value="40">
+                            <span id="settingWaveformHeightValue" class="setting-slider-value">40 px</span>
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <label for="settingSidebarIconGap">Space between sidebar icons</label>
+                        <div class="setting-slider-row">
+                            <input type="range" id="settingSidebarIconGap" min="0" max="30" step="1" value="10">
+                            <span id="settingSidebarIconGapValue" class="setting-slider-value">10 px</span>
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <label for="settingSubcatFilterSize">Subcategory chip size</label>
+                        <div class="setting-slider-row">
+                            <input type="range" id="settingSubcatFilterSize" min="8" max="20" step="1" value="11">
+                            <span id="settingSubcatFilterSizeValue" class="setting-slider-value">11 px</span>
+                        </div>
+                    </div>
                 </div>
                 <div class="dialog-buttons">
                     <button id="closeSettingsBtn" class="btn-primary">Close</button>
@@ -609,7 +779,7 @@
         <input type="file" id="previewPicker" accept="video/*,.webm,.mp4,.gif" style="display: none;">
 
         <!-- Hidden file input for import -->
-        <input type="file" id="importPicker" accept="video/*,audio/*,.mp4,.mp3,.wav,.webm,.mov,.gif,.mogrt,.prproj"
+        <input type="file" id="importPicker" multiple accept="video/*,audio/*,image/*,.mp4,.mp3,.wav,.webm,.mov,.gif,.mogrt,.prproj,.jpg,.jpeg,.png,.webp,.bmp,.tiff,.tif,.psd"
             style="display: none;">
 
     </div>
@@ -624,7 +794,7 @@
     <!-- Pitch Shifter Library -->
     <script src="js/jungle.js"></script>
     <!-- Load main application logic as module -->
-    <script type="module" src="./js/main.js"></script>
+    <script type="module" src="./js/main.js?v=3980"></script>
 </body>
 
 </html>

@@ -7,7 +7,7 @@ import { addLog } from './log.js';
 const fs = window.require('fs');
 const path = window.require('path');
 const os = window.require('os');
-const { exec } = window.require('child_process');
+const { execFile } = window.require('child_process');
 
 const extensionDir = decodeURIComponent(path.dirname(window.location.pathname.replace(/^\//, '')));
 
@@ -113,6 +113,8 @@ const AudioPreview = {
 
     volume: 0.8,
     pitch: 1.0,
+    speed: 1.0,
+    keepPitch: true,
     gainNode: null,
 
     processedAudioPath: null,
@@ -128,7 +130,9 @@ const AudioPreview = {
         this.volumeSlider = document.getElementById('audioVolumeSlider');
         this.pitchSlider = document.getElementById('audioPitchSlider');
         this.pitchValue = document.getElementById('audioPitchValue');
-        this.pitchReset = document.getElementById('audioPitchReset');
+        this.speedSlider = document.getElementById('audioSpeedSlider');
+        this.speedValue = document.getElementById('audioSpeedValue');
+        this.keepPitchCheck = document.getElementById('audioKeepPitch');
         this.reverseCheck = document.getElementById('audioReverseCheck');
         this.timeCurrent = document.getElementById('audioCurrentTime');
         this.timeTotal = document.getElementById('audioTotalTime');
@@ -176,6 +180,15 @@ const AudioPreview = {
             }
         };
 
+        // Double-click the slider to reset it to the default (0.8)
+        this.volumeSlider.ondblclick = () => {
+            this.volume = 0.8;
+            this.volumeSlider.value = 0.8;
+            if (this.gainNode) {
+                this.gainNode.gain.setTargetAtTime(this.volume, this.audioCtx.currentTime, 0.01);
+            }
+        };
+
         // Pitch
         this.pitchSlider.oninput = (e) => {
             this.pitch = parseFloat(e.target.value);
@@ -183,13 +196,40 @@ const AudioPreview = {
             this.updateAudioSettings();
             this.scheduleFFmpegProcessing();
         };
-        this.pitchReset.onclick = () => {
+        // Double-click the slider to reset it to 1.0x
+        this.pitchSlider.ondblclick = () => {
             this.pitch = 1.0;
             this.pitchSlider.value = 1.0;
             if (this.pitchValue) this.pitchValue.textContent = '1.0x';
             this.updateAudioSettings();
             this.scheduleFFmpegProcessing();
         };
+
+        // Speed
+        if (this.speedSlider) {
+            this.speedSlider.oninput = (e) => {
+                this.speed = parseFloat(e.target.value);
+                if (this.speedValue) this.speedValue.textContent = this.speed.toFixed(1) + 'x';
+                this.updateAudioSettings();
+                this.scheduleFFmpegProcessing();
+            };
+            this.speedSlider.ondblclick = () => {
+                this.speed = 1.0;
+                this.speedSlider.value = 1.0;
+                if (this.speedValue) this.speedValue.textContent = '1.0x';
+                this.updateAudioSettings();
+                this.scheduleFFmpegProcessing();
+            };
+        }
+
+        // Keep pitch: stretch the audio so speed changes never shift pitch
+        if (this.keepPitchCheck) {
+            this.keepPitchCheck.onchange = () => {
+                this.keepPitch = this.keepPitchCheck.checked;
+                this.updateAudioSettings();
+                this.scheduleFFmpegProcessing();
+            };
+        }
 
         // Reverse checkbox
         if (this.reverseCheck) {
@@ -272,11 +312,29 @@ const AudioPreview = {
 
         // Set initial pitch UI
         if (this.pitchValue) this.pitchValue.textContent = this.pitch.toFixed(1) + 'x';
+        if (this.speedValue) this.speedValue.textContent = this.speed.toFixed(1) + 'x';
+        if (this.keepPitchCheck) this.keepPitchCheck.checked = this.keepPitch;
         this.updateTimeDisplay();
 
         // Generate Waveform
         this.waveformData = await generateWaveform(asset.path, 200);
         this.draw();
+    },
+
+    /**
+     * Show the preview bar and start playback immediately.
+     * Re-clicking the currently playing asset pauses it; clicking a
+     * paused asset resumes from the current position.
+     */
+    showAndPlay: async function (asset) {
+        const sameVisible = this.asset && this.asset.id === asset.id &&
+            this.el && this.el.classList.contains('visible');
+        if (sameVisible && this.isPlaying) {
+            this.pause();
+            return;
+        }
+        await this.show(asset);
+        this.play();
     },
 
     hide: function () {
@@ -341,7 +399,8 @@ const AudioPreview = {
         } else {
             this.source.buffer = this.audioBuffer;
         }
-        this.source.playbackRate.value = 1.0;
+        this.source.playbackRate.value = this.speed;
+        this._playRate = this.speed;
 
         // Create GainNode if needed
         if (!this.gainNode) {
@@ -360,7 +419,7 @@ const AudioPreview = {
         this.source.connect(this.jungle.input);
         
         // Calculate pitch multiplier for Jungle
-        this.jungle.setPitchOffset(Math.log2(this.pitch));
+        this.jungle.setPitchOffset(Math.log2(this.pitch) - (this.keepPitch ? Math.log2(this.speed) : 0));
 
         // Calculate start time
         if (this.lastPausePosition >= this.audioBuffer.duration) {
@@ -385,7 +444,7 @@ const AudioPreview = {
 
         this.source.onended = () => {
             if (this.isPlaying) {
-                const elapsed = (this.audioCtx.currentTime - this.playbackStartTime);
+                const elapsed = (this.audioCtx.currentTime - this.playbackStartTime) * (this._playRate || 1);
                 if (elapsed >= this.audioBuffer.duration - 0.1) {
                     this.isPlaying = false;
                     this.lastPausePosition = 0;
@@ -407,7 +466,7 @@ const AudioPreview = {
         }
 
         if (this.audioBuffer) {
-            const elapsed = (this.audioCtx.currentTime - this.playbackStartTime);
+            const elapsed = (this.audioCtx.currentTime - this.playbackStartTime) * (this._playRate || 1);
             if (this._isReversedPlayback) {
                 // Convert reversed elapsed back to forward position
                 this.lastPausePosition = this.audioBuffer.duration - elapsed;
@@ -461,7 +520,7 @@ const AudioPreview = {
     updateAudioSettings: function () {
         if (this.isPlaying) {
             // Save current position before restarting
-            const elapsed = (this.audioCtx.currentTime - this.playbackStartTime);
+            const elapsed = (this.audioCtx.currentTime - this.playbackStartTime) * (this._playRate || 1);
             if (this._isReversedPlayback) {
                 this.lastPausePosition = this.audioBuffer.duration - elapsed;
             } else {
@@ -498,7 +557,7 @@ const AudioPreview = {
         if (this.audioBuffer) {
             total = this.audioBuffer.duration;
             if (this.isPlaying) {
-                const elapsed = (this.audioCtx.currentTime - this.playbackStartTime);
+                const elapsed = (this.audioCtx.currentTime - this.playbackStartTime) * (this._playRate || 1);
                 if (this._isReversedPlayback) {
                     current = this.audioBuffer.duration - elapsed;
                 } else {
@@ -523,9 +582,6 @@ const AudioPreview = {
     },
 
     draw: function () {
-        if (!this.waveformData || !this.waveformData.bars) return;
-
-        const { bars } = this.waveformData;
         const width = this.canvas.width;
         const height = this.canvas.height;
 
@@ -547,6 +603,25 @@ const AudioPreview = {
         }
         this.playPosition = Math.max(0, Math.min(playPosition, 1));
         const curPos = this.playPosition;
+
+        // Waveform disabled (slider at minimum): thin progress strip only
+        if (this.el && this.el.classList.contains('waveform-off')) {
+            const trackH = 4;
+            const trackY = (height - trackH) / 2;
+            this.ctx.fillStyle = 'rgba(255, 255, 255, 0.06)';
+            this.ctx.fillRect(0, trackY, width, trackH);
+            if (curPos > 0) {
+                this.ctx.fillStyle = '#818cf8';
+                this.ctx.fillRect(0, trackY, width * curPos, trackH);
+                this.ctx.fillStyle = '#ffffff';
+                this.ctx.fillRect(curPos * width - 1, trackY - 4, 2, trackH + 8);
+            }
+            return;
+        }
+
+        if (!this.waveformData || !this.waveformData.bars) return;
+
+        const { bars } = this.waveformData;
 
         // Colors matching panel UI but brighter for contrast
         const accentColor = '#818cf8';
@@ -609,7 +684,7 @@ const AudioPreview = {
         }
         this.processedAudioPath = null;
         
-        if (this.pitch === 1.0 && (!this.reverseCheck || !this.reverseCheck.checked)) {
+        if (this.pitch === 1.0 && this.speed === 1.0 && (!this.reverseCheck || !this.reverseCheck.checked)) {
             this.isProcessing = false;
             this.processingPromise = Promise.resolve(null);
             return; // No processing needed
@@ -640,16 +715,28 @@ const AudioPreview = {
             if (this.reverseCheck && this.reverseCheck.checked) {
                 filters.push('areverse');
             }
-            if (this.pitch !== 1.0) {
-                // Use rubberband for mathematically perfect pitch shift without tempo change
-                filters.push(`rubberband=pitch=${this.pitch}`);
+            if (this.speed !== 1.0 && !this.keepPitch) {
+                // Varispeed: pitch follows speed - one rubberband pass does both
+                filters.push(`rubberband=pitch=${this.pitch * this.speed}:tempo=${this.speed}`);
+            } else {
+                if (this.pitch !== 1.0) {
+                    // Use rubberband for mathematically perfect pitch shift without tempo change
+                    filters.push(`rubberband=pitch=${this.pitch}`);
+                }
+                if (this.speed !== 1.0) {
+                    // atempo changes tempo without touching pitch (0.5-2.0 is one valid node)
+                    filters.push(`atempo=${this.speed}`);
+                }
             }
             
-            const filterStr = filters.length > 0 ? `-af "${filters.join(',')}"` : '';
-            let cmd = `"${ffmpegExe}" -y -i "${this.asset.path}" ${filterStr} "${tempPath}"`;
+            // execFile with an argument list (no shell): file names containing
+            // %, ^, & or quotes used to break the cmd.exe command line.
+            const ffArgs = ['-y', '-i', this.asset.path];
+            if (filters.length > 0) ffArgs.push('-af', filters.join(','));
+            ffArgs.push(tempPath);
 
-            addLog('Running FFmpeg: ' + cmd, 'info');
-            this.ffmpegProcess = exec(cmd, (err) => {
+            addLog('Running FFmpeg: ' + ffArgs.join(' '), 'info');
+            this.ffmpegProcess = execFile(ffmpegExe, ffArgs, { windowsHide: true }, (err) => {
                 this.isProcessing = false;
                 this.ffmpegProcess = null;
                 if (err) {

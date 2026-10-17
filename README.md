@@ -31,6 +31,88 @@ VibeTools is free and open source (MIT). If it saves you time, you can
 
 ---
 
+## About this fork
+
+This fork builds on [UncleLuki's VibeTools](https://github.com/uncleeai/VibeTools)
+(MIT) with fixes and features made while using it daily in Premiere Pro 2026.
+Everything from the original keeps working; the changes are listed below and in
+[CHANGELOG-FORK.md](CHANGELOG-FORK.md).
+
+<table>
+  <tr>
+    <td width="33%"><img src="docs/fork-sidebar-names.png" alt="Sidebar with category names"></td>
+    <td width="33%"><img src="docs/fork-presets.png" alt="Per-clip presets menu"></td>
+    <td width="33%"><img src="docs/fork-settings.png" alt="Settings"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>Reorderable categories</sub></td>
+    <td align="center"><sub>Per-clip presets (MOGRT, video, image, audio)</sub></td>
+    <td align="center"><sub>Settings</sub></td>
+  </tr>
+  <tr>
+    <td width="33%"><img src="docs/fork-sidebar-menu.png" alt="Sidebar right-click menu"></td>
+    <td width="33%"><img src="docs/fork-library.png" alt="MOGRT asset in the library"></td>
+    <td width="33%"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>Sidebar menu: icons only / reset order</sub></td>
+    <td align="center"><sub>Saved MOGRT asset</sub></td>
+    <td></td>
+  </tr>
+</table>
+
+### MOGRT assets (e.g. titles from AtomX)
+
+- **Native MOGRT save and insert.** A saved MOGRT is stored as its template plus
+  every parameter value. Inserting it places the template directly and applies
+  the values - no clipboard, no helper `VT_Asset` sequence opening and closing.
+- **One history step.** Dragging a saved MOGRT leaves a single *Overwrite* in the
+  History panel; the placeholder drop is taken back with undo, step by step and
+  verified, so a user's own edit is never touched.
+- **Playhead stays put** on double-click and on drag.
+
+### Presets
+
+- **Per-clip presets**, Premiere Composer style: a preset belongs to the clip it
+  was saved from - a MOGRT template, or a video, image or audio file - and is
+  only shown for that clip.
+- **Video presets** read the video part of a linked clip (Motion, Opacity,
+  effects) and are applied to the video part only.
+- **Apply options**: keep the clip's own text (apply only font/size/colour),
+  skip Motion or Opacity, add effects the clip is missing.
+
+### Timeline inserts and undo
+
+- **Ctrl+Z undoes an insert in one step and it stays undone** (a native drag used
+  to come back after the first Ctrl+Z).
+- **No helper actions in the History panel** - no greyed "Create VT_undo..." /
+  "Rename item..." lines, no Create bin / Move / Delete bin chains.
+- **Media goes to the project root** like Premiere's own drag & drop (no
+  `VibeAssets` bin), and a file already in the project is reused, not imported again.
+- **Double-click and drag size video the same way** - your Premiere *Default
+  Media Scaling* decides.
+
+### Library
+
+- **Delete without a confirmation**, including files still held open by a
+  preview (they are released first; anything still locked is removed on the
+  next start, together with leftovers of failed deletes from older versions).
+- **Reorder the category icons** by dragging them; the group separator can be
+  dragged too. Right-click the sidebar for *Icons only / Show names* and
+  *Reset icon order*.
+- **Reopens on the last used category.**
+- **Space between sidebar icons** is adjustable in Settings.
+
+### Reliability
+
+- Fixed inserts that pasted the previous media instead of the chosen asset.
+- Fixed a host-script load failure (`EvalScript error`) caused by an ES3
+  reserved word.
+- Debug log rotation, FFmpeg called without a shell, cache-busted panel files so
+  Premiere never runs a stale copy after an update.
+
+---
+
 ## What it does
 
 - **Save** a timeline selection as a self-contained asset — it captures a real
